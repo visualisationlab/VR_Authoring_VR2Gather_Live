@@ -1,4 +1,4 @@
-using UnityEngine;
+﻿using UnityEngine;
 using UnityEngine.Networking;
 using System.Collections;
 using System.IO;
@@ -9,6 +9,9 @@ public class PosterSpawner : MonoBehaviour
     public Material posterMaterialTemplate;       // Unlit/Texture recommended
     public float surfaceOffsetMeters = 0.005f;
 
+    [Header("Debug")]
+    public bool logSizes = false;
+
     string PostersDir => Path.Combine(Application.persistentDataPath, "posters");
 
     void Awake()
@@ -16,14 +19,41 @@ public class PosterSpawner : MonoBehaviour
         Directory.CreateDirectory(PostersDir);
     }
 
+    // ✅ Existing API (still supported)
     public void CreatePosterAtHit(RaycastHit hit, string imageUrl, float widthMeters, float heightMeters)
     {
-        StartCoroutine(CreatePosterCoroutine(hit, imageUrl, widthMeters, heightMeters));
+        StartCoroutine(CreatePosterCoroutine(
+            hit.collider != null ? hit.collider.transform : null,
+            hit.point,
+            hit.normal,
+            imageUrl,
+            widthMeters,
+            heightMeters
+        ));
     }
 
-    IEnumerator CreatePosterCoroutine(RaycastHit hit, string imageUrl, float widthMeters, float heightMeters)
+    // ✅ NEW API for async jobs (safe to store and use later)
+    public void CreatePosterAtAnchor(VoiceCaptureAndSend.WallAnchor anchor, string imageUrl, float widthMeters, float heightMeters)
     {
-        // 1) Create poster object first (so we have an id for filename)
+        if (!anchor.IsValid())
+        {
+            Debug.LogWarning("[PosterSpawner] CreatePosterAtAnchor: invalid anchor (wall == null).");
+            return;
+        }
+
+        Vector3 point = anchor.WorldPoint();
+        Vector3 normal = anchor.WorldNormal();
+        StartCoroutine(CreatePosterCoroutine(anchor.wall, point, normal, imageUrl, widthMeters, heightMeters));
+    }
+
+    IEnumerator CreatePosterCoroutine(Transform parentWall, Vector3 worldPoint, Vector3 worldNormal,
+                                     string imageUrl, float widthMeters, float heightMeters)
+    {
+        // Clamp sizes (safety)
+        widthMeters = Mathf.Max(0.01f, widthMeters);
+        heightMeters = Mathf.Max(0.01f, heightMeters);
+
+        // 1) Create poster (unparented first so "localScale == world scale")
         var poster = GameObject.CreatePrimitive(PrimitiveType.Quad);
         poster.name = $"Poster_{System.DateTime.Now:HHmmss}";
 
@@ -33,22 +63,30 @@ public class PosterSpawner : MonoBehaviour
         persist.heightMeters = heightMeters;
 
         // 2) Place + orient to wall normal (Quad forward points outward)
-        poster.transform.position = hit.point + hit.normal * surfaceOffsetMeters;
-        poster.transform.rotation = Quaternion.LookRotation(-hit.normal, Vector3.up);
+        Vector3 n = (worldNormal.sqrMagnitude > 0.0001f) ? worldNormal.normalized : Vector3.forward;
 
-        poster.transform.localScale = new Vector3(
-            Mathf.Max(0.01f, widthMeters),
-            Mathf.Max(0.01f, heightMeters),
-            1f
-        );
+        poster.transform.position = worldPoint + n * surfaceOffsetMeters;
+        poster.transform.rotation = Quaternion.LookRotation(-n, Vector3.up);
 
-        // 3) Download texture
+        // 3) Set WORLD size in meters (since it's unparented)
+        poster.transform.localScale = new Vector3(widthMeters, heightMeters, 1f);
+
+        // 4) Now parent it, preserving WORLD transform/scale
+        if (parentWall != null)
+            poster.transform.SetParent(parentWall, worldPositionStays: true);
+
+        if (logSizes && parentWall != null)
+        {
+            Debug.Log($"[PosterSpawner] wall lossyScale={parentWall.lossyScale}, poster localScale={poster.transform.localScale}, poster lossyScale={poster.transform.lossyScale}");
+        }
+
+        // 5) Download texture
         using (var req = UnityWebRequestTexture.GetTexture(imageUrl))
         {
             yield return req.SendWebRequest();
             if (req.result != UnityWebRequest.Result.Success)
             {
-                Debug.LogError("Poster download failed: " + req.error);
+                Debug.LogError("[PosterSpawner] Poster download failed: " + req.error);
                 Destroy(poster);
                 yield break;
             }
@@ -56,7 +94,7 @@ public class PosterSpawner : MonoBehaviour
             var tex = DownloadHandlerTexture.GetContent(req);
             tex.wrapMode = TextureWrapMode.Clamp;
 
-            // 4) Apply material
+            // 6) Apply material
             var r = poster.GetComponent<Renderer>();
             Material mat = (posterMaterialTemplate != null)
                 ? new Material(posterMaterialTemplate)
@@ -65,7 +103,7 @@ public class PosterSpawner : MonoBehaviour
             mat.mainTexture = tex;
             r.material = mat;
 
-            // 5) Save PNG locally (THIS is persistence)
+            // 7) Save PNG locally (persistence)
             byte[] png = tex.EncodeToPNG();
             string localPath = Path.Combine(PostersDir, $"{persist.id}.png");
             File.WriteAllBytes(localPath, png);
@@ -74,7 +112,7 @@ public class PosterSpawner : MonoBehaviour
             Debug.Log("[PosterSpawner] Saved poster png: " + localPath);
         }
 
-        // 6) Optional: make it gaze-editable by your existing system
+        // 8) Optional: make it gaze-editable
         var ai = poster.AddComponent<AIControllable>();
         ai.targetRenderer = poster.GetComponent<Renderer>();
         ai.rb = null;

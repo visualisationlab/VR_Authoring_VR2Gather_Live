@@ -72,7 +72,7 @@ public class GazeTargetInteractor : MonoBehaviour
     {
         if (head == null) return;
 
-        // ✅ NEW: record a real raycast hit for "place poster here" use-cases
+        // ✅ record a real raycast hit for "place poster here" use-cases
         _hasHit = Physics.Raycast(
             head.position,
             head.forward,
@@ -116,7 +116,7 @@ public class GazeTargetInteractor : MonoBehaviour
         }
     }
 
-    // ✅ NEW: expose the gaze RaycastHit for wall/surface placement (posters, decals, etc.)
+    // ✅ expose the gaze RaycastHit for wall/surface placement (posters, decals, etc.)
     public bool TryGetCurrentHit(out RaycastHit hit)
     {
         hit = _lastHit;
@@ -137,6 +137,8 @@ public class GazeTargetInteractor : MonoBehaviour
         _pendingStack = false;
     }
 
+    // ---------------- LOCKING ----------------
+
     public void LockCurrent(bool fromVoice = true)
     {
         if (_lockIsManual && fromVoice)
@@ -155,6 +157,43 @@ public class GazeTargetInteractor : MonoBehaviour
             if (_locked != null)
                 Debug.Log($"[STACK] lockedPos={_locked.transform.position}");
         }
+    }
+
+    // ✅ NEW: lock a specific object even if user is not looking at it
+    public void LockSpecific(AIControllable target, bool fromVoice = true)
+    {
+        if (target == null) return;
+
+        if (_lockIsManual && fromVoice)
+        {
+            if (logStackActions)
+                Debug.Log($"[STACK] VOICE LOCKSPECIFIC IGNORED (manual lock active) locked={NameOrNull(_locked)}");
+            return;
+        }
+
+        _locked = target;
+        _lockIsManual = !fromVoice;
+
+        if (logStackActions)
+            Debug.Log($"[STACK] LOCKSPECIFIC -> locked={NameOrNull(_locked)} fromVoice={fromVoice}");
+    }
+
+    // ✅ convenience for VoiceCaptureAndSend (it remembers a GameObject)
+    public void LockSpecific(GameObject go, bool fromVoice = true)
+    {
+        if (go == null) return;
+
+        // try same object then parent
+        AIControllable a = go.GetComponent<AIControllable>();
+        if (a == null) a = go.GetComponentInParent<AIControllable>();
+        if (a == null)
+        {
+            if (logStackActions)
+                Debug.LogWarning("[GazeTargetInteractor] LockSpecific(GameObject): AIControllable not found on object or parents: " + go.name);
+            return;
+        }
+
+        LockSpecific(a, fromVoice);
     }
 
     public void ClearLock()
@@ -222,82 +261,96 @@ public class GazeTargetInteractor : MonoBehaviour
     public AIControllable Current => _current;
     public AIControllable Locked => _locked;
 
+    // ✅ NEW: effective target for normal actions
+    private AIControllable TargetForActions => (_locked != null) ? _locked : _current;
+
     // ---------------- Gaze APIs ----------------
 
     public void SetColorOnGazed(string colorName)
     {
-        if (_current == null) return;
+        var t = TargetForActions;
+        if (t == null) return;
 
-        if (highlightSelection) RestoreColor(_current);
-        _current.SetColor(colorName);
-        if (highlightSelection) Highlight(_current);
+        // avoid persisting highlight red
+        if (highlightSelection) RestoreColor(t);
+        t.SetColor(colorName);
+        if (highlightSelection) Highlight(t);
 
         if (logStackActions)
-            Debug.Log($"[GAZE] set_color -> target={NameOrNull(_current)} color={colorName}");
+            Debug.Log($"[GAZE] set_color -> target={NameOrNull(t)} color={colorName}");
     }
 
     public void SetMaterialOnGazed(string materialName)
     {
-        if (_current == null) return;
+        var t = TargetForActions;
+        if (t == null) return;
 
         // avoid persisting highlight red
-        if (highlightSelection) RestoreColor(_current);
+        if (highlightSelection) RestoreColor(t);
 
-        _current.SetMaterial(materialName);
+        t.SetMaterial(materialName);
 
-        if (highlightSelection) Highlight(_current);
+        if (highlightSelection) Highlight(t);
 
         if (logStackActions)
-            Debug.Log($"[GAZE] set_material -> target={NameOrNull(_current)} material={materialName}");
+            Debug.Log($"[GAZE] set_material -> target={NameOrNull(t)} material={materialName}");
     }
 
     public void SetScaleUniformOnGazed(float s)
     {
-        if (_current != null) _current.SetScaleUniform(s);
-        if (logStackActions) Debug.Log($"[GAZE] set_scale_uniform -> target={NameOrNull(_current)} s={s}");
+        var t = TargetForActions;
+        if (t != null) t.SetScaleUniform(s);
+        if (logStackActions) Debug.Log($"[GAZE] set_scale_uniform -> target={NameOrNull(t)} s={s}");
     }
 
     public void SetScaleXYZOnGazed(float x, float y, float z)
     {
-        if (_current != null) _current.SetScaleXYZ(x, y, z);
-        if (logStackActions) Debug.Log($"[GAZE] set_scale_xyz -> target={NameOrNull(_current)} x={x} y={y} z={z}");
+        var t = TargetForActions;
+        if (t != null) t.SetScaleXYZ(x, y, z);
+        if (logStackActions) Debug.Log($"[GAZE] set_scale_xyz -> target={NameOrNull(t)} x={x} y={y} z={z}");
     }
 
     public void ScaleGazedBy(float factor)
     {
-        if (_current != null) _current.ScaleBy(factor);
-        if (logStackActions) Debug.Log($"[GAZE] scale_by -> target={NameOrNull(_current)} factor={factor}");
+        var t = TargetForActions;
+        if (t != null) t.ScaleBy(factor);
+        if (logStackActions) Debug.Log($"[GAZE] scale_by -> target={NameOrNull(t)} factor={factor}");
     }
 
     public void MoveGazedToWorld(float x, float y, float z)
     {
-        if (_current != null) _current.MoveWorld(x, y, z);
-        if (logStackActions) Debug.Log($"[GAZE] move -> target={NameOrNull(_current)} x={x} y={y} z={z}");
+        var t = TargetForActions;
+        if (t != null) t.MoveWorld(x, y, z);
+        if (logStackActions) Debug.Log($"[GAZE] move -> target={NameOrNull(t)} x={x} y={y} z={z}");
     }
 
     public void TranslateGazedWorld(float dx, float dy, float dz)
     {
-        if (_current != null) _current.TranslateWorld(dx, dy, dz);
-        if (logStackActions) Debug.Log($"[GAZE] translate -> target={NameOrNull(_current)} dx={dx} dy={dy} dz={dz}");
+        var t = TargetForActions;
+        if (t != null) t.TranslateWorld(dx, dy, dz);
+        if (logStackActions) Debug.Log($"[GAZE] translate -> target={NameOrNull(t)} dx={dx} dy={dy} dz={dz}");
     }
 
     public void PlaceGazedOnFloor(float floorY = 0f)
     {
-        if (_current == null) return;
-        _current.PlaceOnFloor(floorY);
-        if (logStackActions) Debug.Log($"[GAZE] place_on_floor -> target={NameOrNull(_current)} floorY={floorY}");
+        var t = TargetForActions;
+        if (t == null) return;
+        t.PlaceOnFloor(floorY);
+        if (logStackActions) Debug.Log($"[GAZE] place_on_floor -> target={NameOrNull(t)} floorY={floorY}");
     }
 
     public void DropGazed()
     {
-        if (_current != null) _current.Drop();
-        if (logStackActions) Debug.Log($"[GAZE] drop -> target={NameOrNull(_current)}");
+        var t = TargetForActions;
+        if (t != null) t.Drop();
+        if (logStackActions) Debug.Log($"[GAZE] drop -> target={NameOrNull(t)}");
     }
 
     public void FreezeGazed()
     {
-        if (_current != null) _current.Freeze();
-        if (logStackActions) Debug.Log($"[GAZE] freeze -> target={NameOrNull(_current)}");
+        var t = TargetForActions;
+        if (t != null) t.Freeze();
+        if (logStackActions) Debug.Log($"[GAZE] freeze -> target={NameOrNull(t)}");
     }
 
     void Highlight(AIControllable a)
@@ -322,6 +375,21 @@ public class GazeTargetInteractor : MonoBehaviour
             a.TrySetColor(col);
             _savedColors.Remove(a);
         }
+    }
+
+    public void ScaleAxisOnGazed(string axis, float deltaMeters)
+    {
+        var target = TargetForActions;
+        if (target == null) return;
+
+        Vector3 s = target.transform.localScale;
+        switch (axis)
+        {
+            case "x": s.x = Mathf.Max(0.01f, s.x + deltaMeters); break;
+            case "y": s.y = Mathf.Max(0.01f, s.y + deltaMeters); break;
+            case "z": s.z = Mathf.Max(0.01f, s.z + deltaMeters); break;
+        }
+        target.transform.localScale = s;
     }
 
     AIControllable FindBestByAngle()
