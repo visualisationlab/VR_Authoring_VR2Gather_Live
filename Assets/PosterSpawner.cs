@@ -6,7 +6,7 @@ using System.IO;
 public class PosterSpawner : MonoBehaviour
 {
     [Header("Materials")]
-    public Material posterMaterialTemplate;       // Unlit/Texture recommended
+    public Material posterMaterialTemplate;   // Unlit/Texture recommended
     public float surfaceOffsetMeters = 0.005f;
 
     [Header("Debug")]
@@ -19,7 +19,10 @@ public class PosterSpawner : MonoBehaviour
         Directory.CreateDirectory(PostersDir);
     }
 
-    // ✅ Existing API (still supported)
+    // -------------------------------------------------------------------------
+    // Creation API
+    // -------------------------------------------------------------------------
+
     public void CreatePosterAtHit(RaycastHit hit, string imageUrl, float widthMeters, float heightMeters)
     {
         StartCoroutine(CreatePosterCoroutine(
@@ -32,7 +35,6 @@ public class PosterSpawner : MonoBehaviour
         ));
     }
 
-    // ✅ NEW API for async jobs (safe to store and use later)
     public void CreatePosterAtAnchor(VoiceCaptureAndSend.WallAnchor anchor, string imageUrl, float widthMeters, float heightMeters)
     {
         if (!anchor.IsValid())
@@ -46,14 +48,18 @@ public class PosterSpawner : MonoBehaviour
         StartCoroutine(CreatePosterCoroutine(anchor.wall, point, normal, imageUrl, widthMeters, heightMeters));
     }
 
-    IEnumerator CreatePosterCoroutine(Transform parentWall, Vector3 worldPoint, Vector3 worldNormal,
-                                     string imageUrl, float widthMeters, float heightMeters)
+    IEnumerator CreatePosterCoroutine(
+        Transform parentWall,
+        Vector3 worldPoint,
+        Vector3 worldNormal,
+        string imageUrl,
+        float widthMeters,
+        float heightMeters)
     {
-        // Clamp sizes (safety)
         widthMeters = Mathf.Max(0.01f, widthMeters);
         heightMeters = Mathf.Max(0.01f, heightMeters);
 
-        // 1) Create poster (unparented first so "localScale == world scale")
+        // 1) Create quad
         var poster = GameObject.CreatePrimitive(PrimitiveType.Quad);
         poster.name = $"Poster_{System.DateTime.Now:HHmmss}";
 
@@ -62,31 +68,34 @@ public class PosterSpawner : MonoBehaviour
         persist.widthMeters = widthMeters;
         persist.heightMeters = heightMeters;
 
-        // 2) Place + orient to wall normal (Quad forward points outward)
+        // 2) Compute outward normal
         Vector3 n = (worldNormal.sqrMagnitude > 0.0001f) ? worldNormal.normalized : Vector3.forward;
 
+        // 3) Set world pose
         poster.transform.position = worldPoint + n * surfaceOffsetMeters;
         poster.transform.rotation = Quaternion.LookRotation(-n, Vector3.up);
 
-        // 3) Set WORLD size in meters (since it's unparented)
-        poster.transform.localScale = new Vector3(widthMeters, heightMeters, 1f);
-
-        // 4) Now parent it, preserving WORLD transform/scale
+        // 4) Parent BEFORE applying scale so lossyScale compensation is correct
         if (parentWall != null)
             poster.transform.SetParent(parentWall, worldPositionStays: true);
 
-        if (logSizes && parentWall != null)
-        {
-            Debug.Log($"[PosterSpawner] wall lossyScale={parentWall.lossyScale}, poster localScale={poster.transform.localScale}, poster lossyScale={poster.transform.lossyScale}");
-        }
+        ApplyWorldSizeToPoster(poster.transform, widthMeters, heightMeters);
+
+        if (logSizes)
+            Debug.Log($"[PosterSpawner] CREATE parent={(parentWall ? parentWall.name : "null")} " +
+                      $"lossy={(parentWall ? parentWall.lossyScale.ToString() : "n/a")} " +
+                      $"localScale={poster.transform.localScale} " +
+                      $"lossyScale={poster.transform.lossyScale} " +
+                      $"requested=({widthMeters}, {heightMeters})");
 
         // 5) Download texture
         using (var req = UnityWebRequestTexture.GetTexture(imageUrl))
         {
             yield return req.SendWebRequest();
+
             if (req.result != UnityWebRequest.Result.Success)
             {
-                Debug.LogError("[PosterSpawner] Poster download failed: " + req.error);
+                Debug.LogError("[PosterSpawner] Download failed: " + req.error);
                 Destroy(poster);
                 yield break;
             }
@@ -99,11 +108,10 @@ public class PosterSpawner : MonoBehaviour
             Material mat = (posterMaterialTemplate != null)
                 ? new Material(posterMaterialTemplate)
                 : new Material(Shader.Find("Unlit/Texture"));
-
             mat.mainTexture = tex;
             r.material = mat;
 
-            // 7) Save PNG locally (persistence)
+            // 7) Cache PNG locally
             byte[] png = tex.EncodeToPNG();
             string localPath = Path.Combine(PostersDir, $"{persist.id}.png");
             File.WriteAllBytes(localPath, png);
@@ -112,10 +120,33 @@ public class PosterSpawner : MonoBehaviour
             Debug.Log("[PosterSpawner] Saved poster png: " + localPath);
         }
 
-        // 8) Optional: make it gaze-editable
+        // 8) Make gaze-editable
         var ai = poster.AddComponent<AIControllable>();
         ai.targetRenderer = poster.GetComponent<Renderer>();
         ai.rb = null;
         ai.useRigidbodyWhenAvailable = false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Scale utility — used by both CreatePosterCoroutine and SceneStateStore.
+    // Must be called AFTER parenting so lossyScale is correct.
+    // -------------------------------------------------------------------------
+    public void ApplyWorldSizeToPoster(Transform posterTransform, float widthMeters, float heightMeters)
+    {
+        widthMeters = Mathf.Max(0.01f, widthMeters);
+        heightMeters = Mathf.Max(0.01f, heightMeters);
+
+        Vector3 parentLossy = posterTransform.parent != null
+            ? posterTransform.parent.lossyScale
+            : Vector3.one;
+
+        float safeX = Mathf.Abs(parentLossy.x) > 0.0001f ? Mathf.Abs(parentLossy.x) : 1f;
+        float safeY = Mathf.Abs(parentLossy.y) > 0.0001f ? Mathf.Abs(parentLossy.y) : 1f;
+
+        posterTransform.localScale = new Vector3(
+            widthMeters / safeX,
+            heightMeters / safeY,
+            1f
+        );
     }
 }

@@ -1,16 +1,13 @@
-using UnityEngine;
+﻿using UnityEngine;
 
 [DisallowMultipleComponent]
 public class PersistablePoster : MonoBehaviour
 {
     public string id;
-
     // Where the image came from (optional, good for debugging / re-download)
     public string imageUrl;
-
     // Where the image is stored locally (this is what guarantees persistence)
     public string localPngPath;
-
     public float widthMeters = 1f;
     public float heightMeters = 1f;
 
@@ -24,11 +21,10 @@ public class PersistablePoster : MonoBehaviour
     public class PosterState
     {
         public string id;
-
         public float px, py, pz;
         public float rx, ry, rz, rw;
-        public float sx, sy, sz;
-
+        // sx/sy/sz intentionally removed — localScale is parent-dependent and
+        // must be recomputed via PosterSpawner.ApplyWorldSizeToPoster() on restore.
         public float widthMeters, heightMeters;
         public string imageUrl;
         public string localPngPath;
@@ -47,9 +43,7 @@ public class PersistablePoster : MonoBehaviour
             ry = t.rotation.y,
             rz = t.rotation.z,
             rw = t.rotation.w,
-            sx = t.localScale.x,
-            sy = t.localScale.y,
-            sz = t.localScale.z,
+            // ✅ sx/sy/sz NOT saved — widthMeters/heightMeters are the source of truth
             widthMeters = widthMeters,
             heightMeters = heightMeters,
             imageUrl = imageUrl,
@@ -57,12 +51,16 @@ public class PersistablePoster : MonoBehaviour
         };
     }
 
+    // Apply only restores pose and metadata.
+    // Scale MUST be set by PosterSpawner.ApplyWorldSizeToPoster() AFTER parenting,
+    // so do NOT set localScale here.
     public void Apply(PosterState s)
     {
         transform.position = new Vector3(s.px, s.py, s.pz);
         transform.rotation = new Quaternion(s.rx, s.ry, s.rz, s.rw);
-        transform.localScale = new Vector3(s.sx, s.sy, s.sz);
-
+        // ✅ localScale intentionally NOT set here — caller must call
+        //    posterSpawner.ApplyWorldSizeToPoster(transform, s.widthMeters, s.heightMeters)
+        //    after parenting is done.
         widthMeters = s.widthMeters;
         heightMeters = s.heightMeters;
         imageUrl = s.imageUrl;

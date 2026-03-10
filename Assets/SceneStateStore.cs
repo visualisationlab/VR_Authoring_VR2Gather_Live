@@ -5,7 +5,7 @@ using System.IO;
 /// SceneStateStore
 /// - Saves/loads PersistableAIObject transforms/material/color
 /// - ALSO saves/loads posters (PersistablePoster) including local PNG path
-/// - Spawns posters on Load (because posters are created at runtime and won’t exist in-scene)
+/// - Spawns posters on Load (because posters are created at runtime and won't exist in-scene)
 public class SceneStateStore : MonoBehaviour
 {
     public bool loadOnStart = true;
@@ -90,7 +90,6 @@ public class SceneStateStore : MonoBehaviour
         // ---- Load/apply normal AI objects (only applies to objects already in the scene) ----
         if (state.objects != null)
         {
-            // Build lookup by id
             var persistables = FindObjectsOfType<PersistableAIObject>(true);
             var map = new Dictionary<string, PersistableAIObject>();
             foreach (var p in persistables)
@@ -116,8 +115,6 @@ public class SceneStateStore : MonoBehaviour
             foreach (var e in existing)
                 if (e != null && !string.IsNullOrEmpty(e.id)) existingIds.Add(e.id);
 
-            // Optional: if you have a PosterSpawner with a template material, use it.
-            // If not found, we still spawn posters with a basic Unlit/Texture material.
             var spawner = FindFirstObjectByType<PosterSpawner>();
 
             foreach (var ps in state.posters)
@@ -134,22 +131,30 @@ public class SceneStateStore : MonoBehaviour
 
     void SpawnPosterFromState(PersistablePoster.PosterState s, PosterSpawner spawner)
     {
-        // Create quad
         var poster = GameObject.CreatePrimitive(PrimitiveType.Quad);
-
-        // ✅ FIX: PersistablePoster.PosterState does NOT contain "name"
-        // (your earlier version referenced s.name which would not compile)
         poster.name = "Poster_Loaded";
 
-        // Add persistable + apply transform/meta
+        // Add component and restore pose + metadata (Apply does NOT touch localScale)
         var persist = poster.AddComponent<PersistablePoster>();
         persist.id = s.id;
         persist.Apply(s);
 
-        // Apply transform
-        poster.transform.position = new Vector3(s.px, s.py, s.pz);
-        poster.transform.rotation = new Quaternion(s.rx, s.ry, s.rz, s.rw);
-        poster.transform.localScale = new Vector3(s.sx, s.sy, s.sz);
+        // ✅ Recompute localScale from widthMeters/heightMeters AFTER parenting
+        // (no parent here at load time, but still use the correct path so
+        //  lossyScale compensation is always applied consistently)
+        if (spawner != null)
+        {
+            spawner.ApplyWorldSizeToPoster(poster.transform, s.widthMeters, s.heightMeters);
+        }
+        else
+        {
+            // Fallback: no parent, so lossyScale == Vector3.one — safe to set directly
+            poster.transform.localScale = new Vector3(
+                Mathf.Max(0.01f, s.widthMeters),
+                Mathf.Max(0.01f, s.heightMeters),
+                1f
+            );
+        }
 
         // Renderer + material
         var r = poster.GetComponent<Renderer>();
@@ -174,10 +179,9 @@ public class SceneStateStore : MonoBehaviour
         else
         {
             Debug.LogWarning("[SceneStateStore] Poster PNG missing on disk: " + s.localPngPath);
-            // You *could* re-download using s.imageUrl here, but that requires a coroutine.
         }
 
-        // Optional: let your gaze/voice transform controls work on posters too
+        // Make gaze/voice controllable
         var ai = poster.AddComponent<AIControllable>();
         ai.targetRenderer = r;
         ai.rb = null;
