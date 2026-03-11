@@ -311,6 +311,7 @@ public class VoiceCaptureAndSend : MonoBehaviour
         public float height_m;
         public string image_url;
         public string image_prompt;
+        public string behaviour_prompt;
     }
 
     [System.Serializable]
@@ -392,6 +393,9 @@ public class VoiceCaptureAndSend : MonoBehaviour
         var devices = new List<InputDevice>();
         InputDevices.GetDevicesAtXRNode(XRNode.RightHand, devices);
         if (devices.Count > 0) rightController = devices[0];
+
+        if (AICodeCommandHandler.Instance == null)
+            Debug.LogWarning("[VoiceCaptureAndSend] AICodeCommandHandler not found in scene.");
     }
 
     void Update()
@@ -883,6 +887,33 @@ public class VoiceCaptureAndSend : MonoBehaviour
 
                     int jobId = StartJob("texture", "TEXTURE_GENERATION", commandTarget);
                     StartCoroutine(GenerateTextureAndApply_Job(jobId, tPrompt, anchor, tileScale));
+                    return true;
+                }
+
+            case "run_code":
+                {
+                    GameObject runTarget = commandTarget;
+
+                    if (runTarget == null && !string.IsNullOrWhiteSpace(cmd.target))
+                        runTarget = GameObject.Find(cmd.target);
+
+                    if (runTarget == null)
+                    {
+                        Debug.LogWarning("[VoiceCaptureAndSend] run_code: no target. Look at an object first.");
+                        return false;
+                    }
+
+                    string prompt = !string.IsNullOrWhiteSpace(cmd.behaviour_prompt) ? cmd.behaviour_prompt
+                                  : !string.IsNullOrWhiteSpace(cmd.prompt) ? cmd.prompt
+                                  : "make this object rotate slowly";
+
+                    if (AICodeCommandHandler.Instance == null)
+                    {
+                        Debug.LogError("[VoiceCaptureAndSend] AICodeCommandHandler is not in the scene.");
+                        return false;
+                    }
+
+                    AICodeCommandHandler.Instance.HandleCommand(prompt, runTarget);
                     return true;
                 }
 
