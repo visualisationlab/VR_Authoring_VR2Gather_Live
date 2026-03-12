@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using UnityEngine;
 using UnityEngine.Networking;
 using GLTFast;
@@ -13,6 +14,10 @@ public class RuntimeModelSpawner : MonoBehaviour
 
     [Header("Persistence")]
     public bool loadOnStart = true;
+
+    [Header("Generated Model Setup")]
+    public bool addMeshCollidersToChildren = true;
+    public bool addRootBoxColliderIfMissing = true;
 
     string ModelsDir => Path.Combine(Application.persistentDataPath, "GeneratedModels");
     string RegistryPath => Path.Combine(Application.persistentDataPath, "generated_models_registry.json");
@@ -42,13 +47,12 @@ public class RuntimeModelSpawner : MonoBehaviour
         public string art_style = "realistic";
     }
 
-    // IMPORTANT: match what your server returns (VoiceCaptureAndSend uses: status + progress + downloadUrl)
     [Serializable]
     class TextTo3DResponse
     {
-        public string status;        // e.g. PENDING / SUCCEEDED / FAILED  (or done)
-        public int progress;         // 0..100 (if server sends it; default 0)
-        public string downloadUrl;   // MUST be exactly "downloadUrl" in server JSON
+        public string status;
+        public int progress;
+        public string downloadUrl;
         public string message;
         public string jobId;
     }
@@ -71,13 +75,17 @@ public class RuntimeModelSpawner : MonoBehaviour
 
     IEnumerator GenerateAndSpawnCo(string prompt, string assetName, Vector3 position, string stage, string artStyle)
     {
-        // 1) Ask server for model (poll until ready)
-        var reqObj = new TextTo3DRequest { prompt = prompt, name = assetName, stage = stage, art_style = artStyle };
-        string jsonReq = JsonUtility.ToJson(reqObj);
+        var reqObj = new TextTo3DRequest
+        {
+            prompt = prompt,
+            name = assetName,
+            stage = stage,
+            art_style = artStyle
+        };
 
+        string jsonReq = JsonUtility.ToJson(reqObj);
         string downloadUrl = null;
 
-        // Poll up to ~12 minutes (240 * 3 sec)
         for (int attempt = 1; attempt <= 240; attempt++)
         {
             using (var www = new UnityWebRequest(generateEndpoint, "POST"))
@@ -114,10 +122,6 @@ public class RuntimeModelSpawner : MonoBehaviour
 
                     Debug.Log($"[RuntimeModelSpawner] Poll {attempt}/240 status={st} progress={pr} url={(string.IsNullOrEmpty(resp.downloadUrl) ? "null" : "ok")}");
 
-                    // Accept multiple conventions:
-                    // - done + downloadUrl
-                    // - SUCCEEDED + downloadUrl
-                    // - progress>=100 + downloadUrl
                     bool ready =
                         !string.IsNullOrEmpty(resp.downloadUrl) &&
                         (st == "DONE" || st == "SUCCEEDED" || st == "SUCCESS" || pr >= 100);
@@ -145,7 +149,6 @@ public class RuntimeModelSpawner : MonoBehaviour
             yield break;
         }
 
-        // 2) Download GLB to persistentDataPath
         string safeName = Sanitize(assetName);
         string localPath = Path.Combine(ModelsDir, safeName + ".glb");
 
@@ -171,10 +174,8 @@ public class RuntimeModelSpawner : MonoBehaviour
             }
         }
 
-        // 3) Load GLB via glTFast runtime
         yield return LoadGlbIntoScene(localPath, assetName, position);
 
-        // 4) Save registry so it persists
         SaveRecord(new SpawnRecord
         {
             name = assetName,
@@ -194,15 +195,16 @@ public class RuntimeModelSpawner : MonoBehaviour
         }
 
         var import = new GltfImport();
-
-        // Use a safe absolute file URI on Windows: file:///C:/...
         string uri = new Uri(localGlbPath).AbsoluteUri;
 
         var loadTask = import.Load(uri);
         while (!loadTask.IsCompleted) yield return null;
 
         bool success = false;
-        try { success = loadTask.Result; }
+        try
+        {
+            success = loadTask.Result;
+        }
         catch (Exception e)
         {
             Debug.LogError("[RuntimeModelSpawner] glTFast Load threw: " + e);
@@ -221,15 +223,61 @@ public class RuntimeModelSpawner : MonoBehaviour
         var instTask = import.InstantiateMainSceneAsync(go.transform);
         while (!instTask.IsCompleted) yield return null;
 
-        // If you ever spawn but can't see it, uncomment to force it visible in front of camera:
-        // var cam = Camera.main;
-        // if (cam != null) go.transform.position = cam.transform.position + cam.transform.forward * 2f;
+        var ai = go.GetComponent<AIControllable>();
+        if (ai == null)
+            ai = go.AddComponent<AIControllable>();
 
-        // Optional: attach your controller so voice can color/move/scale it
-        if (go.GetComponent<AIControllable>() == null)
-            go.AddComponent<AIControllable>();
+        Renderer[] childRenderers = go.GetComponentsInChildren<Renderer>(true);
+        if (childRenderers != null && childRenderers.Length > 0)
+        {
+            ai.targetRenderer = childRenderers
+                .OrderByDescending(r => r.bounds.size.magnitude)
+                .FirstOrDefault();
+        }
 
-        Debug.Log($"✅ Spawned runtime model: {instanceName} @ {localGlbPath} | children={go.transform.childCount}");
+        if (addMeshCollidersToChildren)
+        {
+            var meshFilters = go.GetComponentsInChildren<MeshFilter>(true);
+            foreach (var mf in meshFilters)
+            {
+                if (mf == null || mf.sharedMesh == null)
+                    continue;
+
+                if (mf.GetComponent<Collider>() == null)
+                {
+                    try
+                    {
+                        var mc = mf.gameObject.AddComponent<MeshCollider>();
+                        mc.sharedMesh = mf.sharedMesh;
+                    }
+                    catch (Exception e)
+                    {
+                        Debug.LogWarning("[RuntimeModelSpawner] Could not add MeshCollider to " + mf.name + ": " + e.Message);
+                    }
+                }
+            }
+        }
+
+        if (addRootBoxColliderIfMissing && go.GetComponentInChildren<Collider>(true) == null)
+        {
+            var bc = go.AddComponent<BoxCollider>();
+
+            if (ai.targetRenderer != null)
+            {
+                Bounds b = ai.targetRenderer.bounds;
+                bc.center = go.transform.InverseTransformPoint(b.center);
+                bc.size = b.size;
+            }
+            else
+            {
+                bc.center = Vector3.zero;
+                bc.size = Vector3.one;
+            }
+        }
+
+        Debug.Log(
+            $"✅ Spawned runtime model: {instanceName} @ {localGlbPath} | children={go.transform.childCount} | targetRenderer={(ai.targetRenderer ? ai.targetRenderer.name : "null")}"
+        );
     }
 
     IEnumerator RespawnSavedModels()
@@ -247,8 +295,6 @@ public class RuntimeModelSpawner : MonoBehaviour
     void SaveRecord(SpawnRecord rec)
     {
         var reg = LoadRegistry();
-
-        // avoid duplicates by name (simple strategy)
         reg.items.RemoveAll(x => x.name == rec.name);
         reg.items.Add(rec);
 
@@ -258,6 +304,7 @@ public class RuntimeModelSpawner : MonoBehaviour
     Registry LoadRegistry()
     {
         if (!File.Exists(RegistryPath)) return new Registry();
+
         try
         {
             return JsonUtility.FromJson<Registry>(File.ReadAllText(RegistryPath)) ?? new Registry();
@@ -272,6 +319,7 @@ public class RuntimeModelSpawner : MonoBehaviour
     {
         foreach (var c in Path.GetInvalidFileNameChars())
             s = s.Replace(c, '_');
+
         return s.Trim();
     }
 }
