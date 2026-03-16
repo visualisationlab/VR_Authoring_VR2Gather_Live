@@ -1,4 +1,4 @@
-﻿using UnityEngine;
+using UnityEngine;
 using UnityEngine.Networking;
 using System.Collections;
 using System.IO;
@@ -33,7 +33,51 @@ public class WallTextureApplier : MonoBehaviour
         StartCoroutine(ApplyTextureCoroutine_FromWall(anchor.wall, imageUrl, tileScale));
     }
 
+    // ✅ RESTORE API — called by SceneStateStore on scene reload.
+    // Prefers the locally-cached PNG (no network needed); falls back to the
+    // original URL if the file is missing. Always re-computes tile count from
+    // the renderer's current world-space bounds so tiling is correct after reload.
+    public void RestoreTexture(PersistableAIObject persist)
+    {
+        if (persist == null) return;
+
+        // Prefer the saved local file so we don't re-hit the network.
+        bool hasLocal = !string.IsNullOrEmpty(persist.localTexturePath)
+                        && File.Exists(persist.localTexturePath);
+
+        if (hasLocal)
+            StartCoroutine(RestoreFromLocalFile(persist));
+        else if (!string.IsNullOrEmpty(persist.textureUrl))
+            StartCoroutine(ApplyTextureCoroutine_FromWall(persist.transform, persist.textureUrl, persist.tileScale));
+        else
+            Debug.LogWarning($"[WallTextureApplier] RestoreTexture: nothing to restore for '{persist.name}'.");
+    }
+
     // ------------------ Internals ------------------
+
+    IEnumerator RestoreFromLocalFile(PersistableAIObject persist)
+    {
+        // UnityWebRequest handles file:// URIs cross-platform.
+        string uri = "file://" + persist.localTexturePath;
+
+        using (var req = UnityWebRequestTexture.GetTexture(uri))
+        {
+            yield return req.SendWebRequest();
+
+            if (req.result != UnityWebRequest.Result.Success)
+            {
+                Debug.LogWarning($"[WallTextureApplier] Local texture load failed ({req.error}), falling back to URL.");
+                if (!string.IsNullOrEmpty(persist.textureUrl))
+                    yield return ApplyTextureCoroutine_FromWall(persist.transform, persist.textureUrl, persist.tileScale);
+                yield break;
+            }
+
+            var tex = DownloadHandlerTexture.GetContent(req);
+            if (tex == null) yield break;
+
+            ApplyTextureToRenderer(persist, tex, persist.tileScale);
+        }
+    }
 
     IEnumerator ApplyTextureCoroutine_FromHit(RaycastHit hit, string imageUrl, float tileScale)
     {
@@ -67,14 +111,6 @@ public class WallTextureApplier : MonoBehaviour
             yield break;
         }
 
-        // ✅ Safer: renderer may be on child
-        var r = wallRoot.GetComponentInChildren<Renderer>(true);
-        if (r == null)
-        {
-            Debug.LogWarning("[WallTextureApplier] No Renderer found on wall or its children.");
-            yield break;
-        }
-
         // 1) Download image from URL
         using (var req = UnityWebRequestTexture.GetTexture(imageUrl))
         {
@@ -92,57 +128,105 @@ public class WallTextureApplier : MonoBehaviour
                 yield break;
             }
 
-            tex.wrapMode = TextureWrapMode.Repeat;
+            // 2) Apply + save
+            ApplyTextureToRenderer(persist, tex, tileScale);
 
-            float ts = (tileScale > 0f) ? tileScale : defaultTileScale;
-
-            // 2) Create a fresh Standard material (prevents black tint)
-            Shader std = Shader.Find("Standard");
-            if (std == null)
-            {
-                Debug.LogError("[WallTextureApplier] Standard shader not found.");
-                yield break;
-            }
-
-            Material newMat = new Material(std);
-            newMat.name = $"TexMat_{persist.id}";
-            newMat.mainTexture = tex;
-            newMat.color = Color.white;                 // ✅ critical: prevents tinting-to-black
-            newMat.SetFloat("_Metallic", 0f);
-            newMat.SetFloat("_Glossiness", 0.1f);
-            newMat.mainTextureScale = new Vector2(ts, ts);
-
-            // Apply to all sub-materials (multi-material renderers)
-            var mats = r.materials;
-            if (mats == null || mats.Length == 0)
-            {
-                r.material = newMat;
-            }
-            else
-            {
-                for (int i = 0; i < mats.Length; i++)
-                    mats[i] = newMat;
-                r.materials = mats;
-            }
-
-            // 3) Save PNG locally (persistence)
             byte[] png = tex.EncodeToPNG();
             string localPath = Path.Combine(TexturesDir, $"{persist.id}_tex.png");
             File.WriteAllBytes(localPath, png);
 
-            // 4) Store on PersistableAIObject so SceneStateStore saves it
-            persist.textureUrl = imageUrl;
+            persist.textureUrl       = imageUrl;
             persist.localTexturePath = localPath;
-            persist.tileScale = ts;
+            persist.tileScale        = (tileScale > 0f) ? tileScale : defaultTileScale;
 
-            // Optional: ensure any “saved color” won’t tint textures later
             if (persist.controllable != null)
                 persist.controllable.TrySetColor(Color.white);
 
-            // 5) Request scene save
             FindFirstObjectByType<SceneStateStore>()?.RequestSave();
 
             Debug.Log("[WallTextureApplier] Applied + saved texture png: " + localPath);
         }
+    }
+
+    // ── Single authoritative method that sets a texture on a renderer ──────────
+    // Called by every code path (first apply AND restore) so tiling is always
+    // computed from current world-space bounds — never left at the Unity default (1,1).
+    void ApplyTextureToRenderer(PersistableAIObject persist, Texture2D tex, float tileScale)
+    {
+        // ✅ Safer: renderer may be on child
+        var r = persist.transform.GetComponentInChildren<Renderer>(true);
+        if (r == null)
+        {
+            Debug.LogWarning("[WallTextureApplier] No Renderer found on wall or its children.");
+            return;
+        }
+
+        tex.wrapMode   = TextureWrapMode.Repeat;
+        tex.filterMode = FilterMode.Bilinear;
+
+        float ts = (tileScale > 0f) ? tileScale : defaultTileScale;
+
+        // ✅ KEY FIX: always recompute from current world-space bounds.
+        // On restore the renderer is live and bounds are correct, so this
+        // produces the same tile count as the original apply — no stretching.
+        Vector2 tileCount = ComputeTileCount(r, ts);
+
+        Shader std = Shader.Find("Standard");
+        if (std == null)
+        {
+            Debug.LogError("[WallTextureApplier] Standard shader not found.");
+            return;
+        }
+
+        Material newMat = new Material(std);
+        newMat.name              = $"TexMat_{persist.id}";
+        newMat.mainTexture       = tex;
+        newMat.color             = Color.white;      // prevents tinting-to-black
+        newMat.SetFloat("_Metallic",    0f);
+        newMat.SetFloat("_Glossiness",  0.1f);
+        newMat.mainTextureScale  = tileCount;        // ✅ tiling, not stretching
+        newMat.mainTextureOffset = Vector2.zero;
+
+        // Apply to all sub-materials (multi-material renderers)
+        var mats = r.materials;
+        if (mats == null || mats.Length == 0)
+        {
+            r.material = newMat;
+        }
+        else
+        {
+            for (int i = 0; i < mats.Length; i++)
+                mats[i] = newMat;
+            r.materials = mats;
+        }
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Works out how many times the texture should repeat across the surface.
+    /// Uses the renderer's world-space bounds so a 10 m wall tiled at 1.8 m gets
+    /// ~5-6 repeats, while a 1 m wall gets just 1.
+    /// Falls back to (1,1) if bounds can't be determined.
+    /// </summary>
+    static Vector2 ComputeTileCount(Renderer r, float tileSizeInWorldUnits)
+    {
+        if (r == null || tileSizeInWorldUnits <= 0f)
+            return Vector2.one;
+
+        Bounds bounds = r.bounds;   // world-space AABB
+
+        // Width = longest horizontal extent; height = Y axis.
+        float width  = Mathf.Max(bounds.size.x, bounds.size.z);
+        float height = bounds.size.y;
+
+        // Floor/ceiling fallback (very thin on Y)
+        if (height < 0.01f)
+            height = Mathf.Min(bounds.size.x, bounds.size.z);
+
+        float repeatX = Mathf.Max(1f, Mathf.Round(width  / tileSizeInWorldUnits));
+        float repeatY = Mathf.Max(1f, Mathf.Round(height / tileSizeInWorldUnits));
+
+        return new Vector2(repeatX, repeatY);
     }
 }

@@ -98,11 +98,22 @@ public class SceneStateStore : MonoBehaviour
                     map[p.id] = p;
             }
 
+            // Cached once — RestoreTexture starts a coroutine so it's cheap per call,
+            // but FindFirstObjectByType in a loop would be wasteful.
+            var texApplier = FindFirstObjectByType<WallTextureApplier>();
+
             foreach (var s in state.objects)
             {
                 if (s == null || string.IsNullOrEmpty(s.id)) continue;
-                if (map.TryGetValue(s.id, out var p))
-                    p.Apply(s);
+                if (!map.TryGetValue(s.id, out var p)) continue;
+
+                p.Apply(s);
+
+                // Restore wall texture if one was saved (uses local PNG, falls back to URL).
+                // WallTextureApplier.RestoreTexture re-computes tile count from live bounds
+                // so the texture tiles correctly instead of stretching to (1,1).
+                if (texApplier != null && !string.IsNullOrEmpty(s.textureUrl))
+                    texApplier.RestoreTexture(p);
             }
         }
 

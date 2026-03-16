@@ -657,9 +657,40 @@ public class VoiceCaptureAndSend : MonoBehaviour
 
             if (result.commands != null && result.commands.Length > 0)
             {
+                bool hasRunnableCodeTarget = false;
+
+                foreach (var c in result.commands)
+                {
+                    if (c == null || string.IsNullOrWhiteSpace(c.action)) continue;
+
+                    string action = c.action.Trim().ToLowerInvariant();
+                    if (action != "run_code") continue;
+
+                    GameObject runTarget = commandTarget;
+                    if (runTarget == null && !string.IsNullOrWhiteSpace(c.target))
+                        runTarget = GameObject.Find(c.target);
+
+                    if (runTarget != null)
+                    {
+                        hasRunnableCodeTarget = true;
+                        break;
+                    }
+                }
+
                 foreach (var c in result.commands)
                 {
                     if (c == null) continue;
+
+                    string action = string.IsNullOrWhiteSpace(c.action)
+                        ? ""
+                        : c.action.Trim().ToLowerInvariant();
+
+                    if (hasRunnableCodeTarget && action == "generate_model")
+                    {
+                        Debug.Log("[VoiceCaptureAndSend] Skipping generate_model because run_code has a valid target.");
+                        continue;
+                    }
+
                     bool startedJob = ApplyCommand(c, commandTarget, commandWallAnchor, requestStartTime);
                     startedAnyAsyncJob |= startedJob;
                     executedAnything = true;

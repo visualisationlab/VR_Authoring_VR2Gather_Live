@@ -63,10 +63,43 @@ public class RuntimeBehaviourRegistry : MonoBehaviour
         StartCoroutine(ReattachNextFrame());
     }
 
+    // Required namespaces every AI-generated MonoBehaviour needs.
+    // Prepended automatically if missing so Roslyn never hits CS0246.
+    static readonly string[] kRequiredUsings =
+    {
+        "using System;",
+        "using System.Collections;",
+        "using System.Collections.Generic;",
+        "using UnityEngine;",
+        "using UnityEngine.Networking;",
+        "using System.IO;",
+    };
+
+    static string InjectUsings(string code)
+    {
+        // Normalise the AI-generated code to Windows line endings (CR LF)
+        // so Visual Studio doesn't show the "Inconsistent Line Endings" dialog.
+        code = code.Replace("\r\n", "\n").Replace("\r", "\n").Replace("\n", "\r\n");
+
+        var sb = new StringBuilder();
+        foreach (var u in kRequiredUsings)
+            if (!code.Contains(u))
+                sb.Append(u + "\r\n");
+        sb.Append(code);
+        return sb.ToString();
+    }
+
     public bool RegisterAndAttach(GameObject target, string csharpCode)
     {
         if (target == null || string.IsNullOrWhiteSpace(csharpCode))
             return false;
+
+        // Always attach to the root of the hierarchy, not a child mesh/collider.
+        // This prevents scripts landing on Mesh1.0 or similar child objects.
+        target = ResolveRootTarget(target);
+
+        // Ensure all required namespaces are present before handing to Roslyn
+        csharpCode = InjectUsings(csharpCode);
 
         string className = ExtractClassName(csharpCode);
         if (string.IsNullOrEmpty(className))
@@ -74,6 +107,10 @@ public class RuntimeBehaviourRegistry : MonoBehaviour
             Debug.LogError("[Registry] No class name found.");
             return false;
         }
+
+        // Remove any stale component with this class name already on the object
+        // (e.g. the old broken script that was attached without a prefab)
+        RemoveStaleComponentByName(target, className);
 
         Type t = CompileType(csharpCode, className, out string errors);
         if (t == null)
@@ -89,7 +126,9 @@ public class RuntimeBehaviourRegistry : MonoBehaviour
 
         string id = Guid.NewGuid().ToString("N");
         string fileName = id + "_" + SanitiseFilename(className) + ".cs";
-        File.WriteAllText(Path.Combine(ScriptsDir, fileName), csharpCode, Encoding.UTF8);
+        // Save the injected source so re-compilation on reload also works
+        // Write with UTF-8 BOM and Windows line endings — keeps Visual Studio happy
+        File.WriteAllText(Path.Combine(ScriptsDir, fileName), csharpCode, new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
 
         var reg = LoadRegistry();
         reg.items.Add(new BehaviourRecord
@@ -539,6 +578,52 @@ public class RuntimeBehaviourRegistry : MonoBehaviour
         return null;
     }
 #endif
+
+    // ------------------------------------------------------------------ helpers
+
+    /// <summary>
+    /// Walks up the hierarchy to find the most sensible root to attach to.
+    /// Prefers a PersistableAIObject ancestor; otherwise uses the topmost
+    /// non-scene-root parent so we never land on a child mesh like Mesh1.0.
+    /// </summary>
+    static GameObject ResolveRootTarget(GameObject go)
+    {
+        if (go == null) return go;
+
+        // Prefer PersistableAIObject in parent chain
+        var persist = go.GetComponentInParent<PersistableAIObject>();
+        if (persist != null) return persist.gameObject;
+
+        // Otherwise walk to the topmost parent that isn't the scene root
+        Transform t = go.transform;
+        while (t.parent != null)
+            t = t.parent;
+
+        // t is now the scene-root object — return our original go's top-level child
+        // i.e. the direct child of the scene root, or go itself if it is that child.
+        Transform target = go.transform;
+        while (target.parent != null && target.parent.parent != null)
+            target = target.parent;
+
+        return target.gameObject;
+    }
+
+    /// <summary>
+    /// Removes any component on the GameObject (or its children) whose
+    /// type name matches className — cleans up stale AI-generated scripts.
+    /// </summary>
+    static void RemoveStaleComponentByName(GameObject go, string className)
+    {
+        foreach (var comp in go.GetComponentsInChildren<Component>(true))
+        {
+            if (comp == null) continue;
+            if (comp.GetType().Name == className)
+            {
+                Debug.Log($"[Registry] Removing stale '{className}' from '{comp.gameObject.name}'");
+                Destroy(comp);
+            }
+        }
+    }
 
     static void AttachType(GameObject target, Type t)
     {

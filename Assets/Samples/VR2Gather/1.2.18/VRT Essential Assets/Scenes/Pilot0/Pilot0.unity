@@ -122,6 +122,51 @@ NavMeshSettings:
     debug:
       m_Flags: 0
   m_NavMeshData: {fileID: 0}
+--- !u!1 &18539524
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 18539526}
+  - component: {fileID: 18539525}
+  m_Layer: 0
+  m_Name: ParticleSystemManager
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &18539525
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 18539524}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 11ef14b72c71ec54496bd29284fa93a3, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  prefabPool: []
+--- !u!4 &18539526
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 18539524}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0.134, y: 0.055999994, z: 0.183}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1001 &62718374
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -2373,6 +2418,16 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   generateEndpoint: http://localhost:8000/api/text-to-3d
   loadOnStart: 1
+  addMeshCollidersToChildren: 1
+  addRootBoxColliderIfMissing: 1
+  autoNormalizeSize: 1
+  placeOnGround: 1
+  groundY: 0
+  genericLargestDimensionMeters: 1.5
+  humanHeightMeters: 1.75
+  vehicleLargestDimensionMeters: 4
+  minScaleMultiplier: 0.01
+  maxScaleMultiplier: 100
 --- !u!4 &916773914
 Transform:
   m_ObjectHideFlags: 0
@@ -3259,6 +3314,11 @@ MonoBehaviour:
   maxTokens: 2000
   temperature: 0.2
   statusText: {fileID: 0}
+  targetCamera: {fileID: 0}
+  autoTargetRayDistance: 100
+  autoTargetLayers:
+    serializedVersion: 2
+    m_Bits: 4294967295
 --- !u!114 &1197044166
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -5186,3 +5246,4 @@ SceneRoots:
   - {fileID: 520718607}
   - {fileID: 2028598979}
   - {fileID: 1962552834}
+  - {fileID: 18539526}
