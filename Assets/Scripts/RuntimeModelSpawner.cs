@@ -19,6 +19,31 @@ public class RuntimeModelSpawner : MonoBehaviour
     public bool addMeshCollidersToChildren = true;
     public bool addRootBoxColliderIfMissing = true;
 
+    [Header("Auto Placement")]
+    [Tooltip("If true, normalize spawned model size to a more realistic size.")]
+    public bool autoNormalizeSize = true;
+
+    [Tooltip("If true, move model vertically so its bottom touches groundY.")]
+    public bool placeOnGround = true;
+
+    [Tooltip("World-space Y coordinate of your floor/ground.")]
+    public float groundY = 0f;
+
+    [Tooltip("Fallback target largest dimension for generic objects.")]
+    public float genericLargestDimensionMeters = 1.5f;
+
+    [Tooltip("Target height for humans/avatars.")]
+    public float humanHeightMeters = 1.75f;
+
+    [Tooltip("Target largest dimension for cars/vehicles.")]
+    public float vehicleLargestDimensionMeters = 4.0f;
+
+    [Tooltip("Never scale below this factor in one step.")]
+    public float minScaleMultiplier = 0.01f;
+
+    [Tooltip("Never scale above this factor in one step.")]
+    public float maxScaleMultiplier = 100f;
+
     string ModelsDir => Path.Combine(Application.persistentDataPath, "GeneratedModels");
     string RegistryPath => Path.Combine(Application.persistentDataPath, "generated_models_registry.json");
 
@@ -26,6 +51,7 @@ public class RuntimeModelSpawner : MonoBehaviour
     public class SpawnRecord
     {
         public string name;
+        public string prompt;
         public string localGlbPath;
         public Vector3 position;
         public Vector3 eulerRotation;
@@ -174,19 +200,42 @@ public class RuntimeModelSpawner : MonoBehaviour
             }
         }
 
-        yield return LoadGlbIntoScene(localPath, assetName, position);
+        GameObject spawnedGo = null;
 
-        SaveRecord(new SpawnRecord
+        yield return LoadGlbIntoScene(
+            localPath,
+            assetName,
+            prompt,
+            position,
+            applyAutoPlacement: true,
+            forcedEulerRotation: null,
+            forcedScale: null,
+            onDone: go => { spawnedGo = go; }
+        );
+
+        if (spawnedGo != null)
         {
-            name = assetName,
-            localGlbPath = localPath,
-            position = position,
-            eulerRotation = Vector3.zero,
-            scale = Vector3.one
-        });
+            SaveRecord(new SpawnRecord
+            {
+                name = assetName,
+                prompt = prompt,
+                localGlbPath = localPath,
+                position = spawnedGo.transform.position,
+                eulerRotation = spawnedGo.transform.eulerAngles,
+                scale = spawnedGo.transform.localScale
+            });
+        }
     }
 
-    IEnumerator LoadGlbIntoScene(string localGlbPath, string instanceName, Vector3 position)
+    IEnumerator LoadGlbIntoScene(
+        string localGlbPath,
+        string instanceName,
+        string prompt,
+        Vector3 position,
+        bool applyAutoPlacement,
+        Vector3? forcedEulerRotation = null,
+        Vector3? forcedScale = null,
+        Action<GameObject> onDone = null)
     {
         if (!File.Exists(localGlbPath))
         {
@@ -220,8 +269,28 @@ public class RuntimeModelSpawner : MonoBehaviour
         var go = new GameObject(instanceName);
         go.transform.position = position;
 
+        if (forcedEulerRotation.HasValue)
+            go.transform.eulerAngles = forcedEulerRotation.Value;
+
+        if (forcedScale.HasValue)
+            go.transform.localScale = forcedScale.Value;
+
         var instTask = import.InstantiateMainSceneAsync(go.transform);
         while (!instTask.IsCompleted) yield return null;
+
+        yield return null;
+
+        if (applyAutoPlacement && autoNormalizeSize)
+        {
+            NormalizeModelSize(go, prompt, instanceName);
+            yield return null;
+        }
+
+        if (applyAutoPlacement && placeOnGround)
+        {
+            PlaceModelOnGround(go, groundY);
+            yield return null;
+        }
 
         var ai = go.GetComponent<AIControllable>();
         if (ai == null)
@@ -240,20 +309,17 @@ public class RuntimeModelSpawner : MonoBehaviour
             var meshFilters = go.GetComponentsInChildren<MeshFilter>(true);
             foreach (var mf in meshFilters)
             {
-                if (mf == null || mf.sharedMesh == null)
-                    continue;
+                if (mf == null || mf.sharedMesh == null) continue;
+                if (mf.GetComponent<Collider>() != null) continue;
 
-                if (mf.GetComponent<Collider>() == null)
+                try
                 {
-                    try
-                    {
-                        var mc = mf.gameObject.AddComponent<MeshCollider>();
-                        mc.sharedMesh = mf.sharedMesh;
-                    }
-                    catch (Exception e)
-                    {
-                        Debug.LogWarning("[RuntimeModelSpawner] Could not add MeshCollider to " + mf.name + ": " + e.Message);
-                    }
+                    var mc = mf.gameObject.AddComponent<MeshCollider>();
+                    mc.sharedMesh = mf.sharedMesh;
+                }
+                catch (Exception e)
+                {
+                    Debug.LogWarning("[RuntimeModelSpawner] Could not add MeshCollider to " + mf.name + ": " + e.Message);
                 }
             }
         }
@@ -262,9 +328,8 @@ public class RuntimeModelSpawner : MonoBehaviour
         {
             var bc = go.AddComponent<BoxCollider>();
 
-            if (ai.targetRenderer != null)
+            if (TryGetCombinedRendererBounds(go, out Bounds b))
             {
-                Bounds b = ai.targetRenderer.bounds;
                 bc.center = go.transform.InverseTransformPoint(b.center);
                 bc.size = b.size;
             }
@@ -275,9 +340,15 @@ public class RuntimeModelSpawner : MonoBehaviour
             }
         }
 
+        string boundsText = TryGetCombinedRendererBounds(go, out Bounds finalBounds)
+            ? $"size={finalBounds.size}, minY={finalBounds.min.y:F3}, maxY={finalBounds.max.y:F3}"
+            : "no renderer bounds";
+
         Debug.Log(
-            $"✅ Spawned runtime model: {instanceName} @ {localGlbPath} | children={go.transform.childCount} | targetRenderer={(ai.targetRenderer ? ai.targetRenderer.name : "null")}"
+            $"✅ Spawned runtime model: {instanceName} @ {localGlbPath} | pos={go.transform.position} | rot={go.transform.eulerAngles} | scale={go.transform.localScale} | {boundsText}"
         );
+
+        onDone?.Invoke(go);
     }
 
     IEnumerator RespawnSavedModels()
@@ -288,8 +359,98 @@ public class RuntimeModelSpawner : MonoBehaviour
             if (string.IsNullOrEmpty(item.localGlbPath)) continue;
             if (!File.Exists(item.localGlbPath)) continue;
 
-            yield return LoadGlbIntoScene(item.localGlbPath, item.name, item.position);
+            string promptToUse = string.IsNullOrEmpty(item.prompt) ? item.name : item.prompt;
+
+            yield return LoadGlbIntoScene(
+                item.localGlbPath,
+                item.name,
+                promptToUse,
+                item.position,
+                applyAutoPlacement: false,
+                forcedEulerRotation: item.eulerRotation,
+                forcedScale: item.scale,
+                onDone: null
+            );
         }
+    }
+
+    void NormalizeModelSize(GameObject go, string prompt, string instanceName)
+    {
+        if (!TryGetCombinedRendererBounds(go, out Bounds b))
+        {
+            Debug.LogWarning("[RuntimeModelSpawner] NormalizeModelSize: no renderers found.");
+            return;
+        }
+
+        Vector3 size = b.size;
+        float currentHeight = Mathf.Max(size.y, 0.0001f);
+        float currentLargest = Mathf.Max(size.x, Mathf.Max(size.y, size.z), 0.0001f);
+
+        string text = ((prompt ?? "") + " " + (instanceName ?? "")).ToLowerInvariant();
+        float targetScaleFactor;
+
+        if (ContainsAny(text, "human", "person", "man", "woman", "boy", "girl", "avatar", "character"))
+        {
+            targetScaleFactor = humanHeightMeters / currentHeight;
+            Debug.Log($"[RuntimeModelSpawner] Detected HUMAN. height={currentHeight:F3}m -> target={humanHeightMeters:F3}m");
+        }
+        else if (ContainsAny(text, "car", "vehicle", "truck", "van", "bus", "suv", "automobile"))
+        {
+            targetScaleFactor = vehicleLargestDimensionMeters / currentLargest;
+            Debug.Log($"[RuntimeModelSpawner] Detected VEHICLE. largest={currentLargest:F3}m -> target={vehicleLargestDimensionMeters:F3}m");
+        }
+        else
+        {
+            targetScaleFactor = genericLargestDimensionMeters / currentLargest;
+            Debug.Log($"[RuntimeModelSpawner] Detected GENERIC. largest={currentLargest:F3}m -> target={genericLargestDimensionMeters:F3}m");
+        }
+
+        targetScaleFactor = Mathf.Clamp(targetScaleFactor, minScaleMultiplier, maxScaleMultiplier);
+        go.transform.localScale *= targetScaleFactor;
+
+        if (TryGetCombinedRendererBounds(go, out Bounds after))
+            Debug.Log($"[RuntimeModelSpawner] Size normalized -> bounds size={after.size}");
+    }
+
+    void PlaceModelOnGround(GameObject go, float targetGroundY)
+    {
+        if (!TryGetCombinedRendererBounds(go, out Bounds b))
+        {
+            Debug.LogWarning("[RuntimeModelSpawner] PlaceModelOnGround: no renderers found.");
+            return;
+        }
+
+        float deltaY = targetGroundY - b.min.y;
+        go.transform.position += new Vector3(0f, deltaY, 0f);
+
+        if (TryGetCombinedRendererBounds(go, out Bounds after))
+            Debug.Log($"[RuntimeModelSpawner] Grounded -> bottomY={after.min.y:F3}, targetGroundY={targetGroundY:F3}");
+    }
+
+    bool TryGetCombinedRendererBounds(GameObject go, out Bounds combined)
+    {
+        combined = default;
+        if (go == null) return false;
+
+        var renderers = go.GetComponentsInChildren<Renderer>(true)
+            .Where(r => r != null && r.enabled)
+            .ToArray();
+
+        if (renderers.Length == 0) return false;
+
+        combined = renderers[0].bounds;
+        for (int i = 1; i < renderers.Length; i++)
+            combined.Encapsulate(renderers[i].bounds);
+
+        return true;
+    }
+
+    bool ContainsAny(string text, params string[] keywords)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        foreach (var k in keywords)
+            if (text.Contains(k)) return true;
+        return false;
     }
 
     void SaveRecord(SpawnRecord rec)
@@ -297,7 +458,6 @@ public class RuntimeModelSpawner : MonoBehaviour
         var reg = LoadRegistry();
         reg.items.RemoveAll(x => x.name == rec.name);
         reg.items.Add(rec);
-
         File.WriteAllText(RegistryPath, JsonUtility.ToJson(reg, true));
     }
 
@@ -319,7 +479,6 @@ public class RuntimeModelSpawner : MonoBehaviour
     {
         foreach (var c in Path.GetInvalidFileNameChars())
             s = s.Replace(c, '_');
-
         return s.Trim();
     }
 }
