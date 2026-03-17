@@ -15,7 +15,9 @@ from PIL import Image, ImageDraw
 import base64
 from openai import OpenAI
 import io
+import time
 from dotenv import load_dotenv
+import os
 
 load_dotenv()
 app = FastAPI()
@@ -27,27 +29,37 @@ print("OPENAI_API_KEY loaded:", bool(OPENAI_API_KEY))
 # ---- Paths (Unity persistentDataPath on Windows) ----
 BASE_PATH = os.path.join(
     os.path.expanduser("~"),
-    "AppData", "LocalLow", "DefaultCompany", "VRTApp-TestLocal"
+    "AppData",
+    "LocalLow",
+    "DefaultCompany",
+    "VRTApp-TestLocal"
 )
 os.makedirs(BASE_PATH, exist_ok=True)
 
+# Transcript + temp audio will go here
 TRANSCRIPT_FILE = os.path.join(BASE_PATH, "unity_transcripts.txt")
 AUDIO_DIR = os.path.join(BASE_PATH, "recorded_audio")
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
-MODEL_DIR = os.path.join(BASE_PATH, "GeneratedModels")
+# ---- 3D Model Output ----
+MODEL_DIR = os.path.join(BASE_PATH, "generated_models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
+# Serve generated GLBs at: http://localhost:8000/files/<name>.glb
 app.mount("/files", StaticFiles(directory=MODEL_DIR), name="files")
 
-POSTER_DIR = os.path.join(BASE_PATH, "posters")
+# ---- Poster Output ----
+POSTER_DIR = os.path.join(BASE_PATH, "generated_posters")
 os.makedirs(POSTER_DIR, exist_ok=True)
 
+# Serve posters at: http://localhost:8000/posters/<name>.png
 app.mount("/posters", StaticFiles(directory=POSTER_DIR), name="posters")
 
-TEXTURE_DIR = os.path.join(BASE_PATH, "textures")
+# ---- Texture Output ----
+TEXTURE_DIR = os.path.join(BASE_PATH, "generated_textures")
 os.makedirs(TEXTURE_DIR, exist_ok=True)
 
+# Serve textures at: http://localhost:8000/textures/<name>.png
 app.mount("/textures", StaticFiles(directory=TEXTURE_DIR), name="textures")
 
 # ---- Meshy config ----
@@ -56,8 +68,9 @@ print("MESHY_API_KEY loaded:", bool(MESHY_API_KEY), flush=True)
 
 MESHY_BASE = "https://api.meshy.ai"
 MESHY_TEXT2_3D_CREATE = f"{MESHY_BASE}/openapi/v2/text-to-3d"
-MESHY_TEXT2_3D_GET = f"{MESHY_BASE}/openapi/v2/text-to-3d"
+MESHY_TEXT2_3D_GET = f"{MESHY_BASE}/openapi/v2/text-to-3d"  # + /{id}
 
+# In-memory job tracking by "safe name"
 jobs: Dict[str, Dict[str, Any]] = {}
 
 # ---- Load Whisper model once ----
@@ -65,57 +78,44 @@ print("Loading Whisper model...", flush=True)
 model = WhisperModel("small", device="cpu", compute_type="int8")
 print("Whisper model loaded.", flush=True)
 
-
-# =========================
-# STARTUP EVENTS
-# =========================
-
 @app.on_event("startup")
 def warmup_ollama():
-    print("=" * 40, flush=True)
     print("[startup] Preloading llama3.2 model...", flush=True)
-    print("=" * 40, flush=True)
     try:
-        resp = requests.post(
+        requests.post(
             "http://localhost:11434/api/generate",
             json={
                 "model": "llama3.2:latest",
-                "prompt": 'Convert to JSON commands: "change the color to red"\nReturn: {"commands":[{"action":"set_color","target":"cube","color":"red"}]}',
-                "stream": False,
-                "keep_alive": "60m"
+                "prompt": "warmup",
+                "stream": False
             },
             timeout=60
         )
-        print(f"[startup] Ollama warmup complete. Status: {resp.status_code}", flush=True)
+        print("[startup] Ollama warmup complete.", flush=True)
     except Exception as e:
         print("[startup] Ollama warmup failed:", e, flush=True)
 
 
-@app.on_event("startup")
-def _print_routes():
-    print("=== Registered routes ===", flush=True)
-    for r in app.routes:
-        methods = getattr(r, "methods", None)
-        print(f"{getattr(r, 'path', '')}  {methods}", flush=True)
-    print("=========================", flush=True)
-
-
-# =========================
-# IMAGE GENERATION HELPERS
-# =========================
-
 def _make_ai_poster(prompt: str, out_path: str, w: int, h: int):
+    """
+    Generates an image and saves it to out_path as PNG.
+    Note: many models support only fixed sizes; we generate 1024x1024 then resize.
+    """
+    # generate at a safe supported size
     result = client.images.generate(
         model="gpt-image-1",
         prompt=f"Poster artwork, high quality, no text unless requested. {prompt}",
         size="1024x1024",
     )
+
     img_bytes = base64.b64decode(result.data[0].b64_json)
+
+    # optional: resize to requested w/h
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     if (w, h) != (1024, 1024):
         img = img.resize((w, h), Image.LANCZOS)
-    img.save(out_path, "PNG")
 
+    img.save(out_path, "PNG")
 
 def _make_ai_texture(prompt: str, out_path: str, size_px: int = 1024):
     result = client.images.generate(
@@ -123,47 +123,38 @@ def _make_ai_texture(prompt: str, out_path: str, size_px: int = 1024):
         prompt=f"Seamless tileable texture. Realistic. No perspective. Even lighting. No text. {prompt}",
         size=f"{size_px}x{size_px}",
     )
+
     img_bytes = base64.b64decode(result.data[0].b64_json)
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     img.save(out_path, "PNG")
 
 
-def _make_placeholder_poster(prompt: str, out_path: str, w: int, h: int):
-    # Fallback placeholder — do not delete
-    img = Image.new("RGB", (w, h), (245, 245, 245))
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([8, 8, w - 8, h - 8], outline=(40, 40, 40), width=4)
-    text = (prompt or "Poster").strip()[:220]
-    max_chars = 38 if w >= h else 30
-    lines = [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
-    y = 40
-    for ln in lines[:12]:
-        draw.text((30, y), ln, fill=(20, 20, 20))
-        y += 28
-    img.save(out_path, "PNG")
-
-
-# =========================
-# UTILITY HELPERS
-# =========================
 
 def _safe_name(name: str) -> str:
     safe = re.sub(r"[^a-zA-Z0-9_\-]", "_", (name or "").strip())
     return safe if safe else "generated_model"
 
 
+# ------------------------------
+# robust name + object parsing
+# ------------------------------
 def _slug_to_name(s: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9]+", " ", (s or "")).strip()
     parts = [p.capitalize() for p in s.split() if p]
     if not parts:
         return "Generated_01"
-    base = "".join(parts[:3])
+    base = "".join(parts[:3])  # keep it short
     return f"{base}_01"
 
 
 def _infer_object_phrase(text: str) -> str:
+    """
+    Best-effort extraction of the "thing" user wants to generate.
+    Works even when LLM messes up by copying examples.
+    """
     t = (text or "").strip()
     tl = t.lower()
+
     known_phrases = [
         "cricket ball", "volley ball", "volleyball", "soccer ball", "football",
         "basketball", "tennis ball", "golf ball"
@@ -171,11 +162,14 @@ def _infer_object_phrase(text: str) -> str:
     for kp in known_phrases:
         if kp in tl:
             return kp
+
     tl = re.sub(
         r"\b(please|for me|can you|could you|would you|i want|i need|make|create|generate|build|add|spawn|a|an|the|model|object|3d)\b",
-        " ", tl,
+        " ",
+        tl,
     )
     tl = re.sub(r"\s+", " ", tl).strip()
+
     return tl if tl else t
 
 
@@ -186,9 +180,8 @@ def _looks_like_example_leak(prompt: str, name: str) -> bool:
 
 
 # =========================
-# MATERIAL INTENT HELPERS
+# MATERIAL INTENT HELPERS  ✅ (prevents "generate_model: wood")
 # =========================
-
 MATERIAL_ALIASES = {
     "wooden": "wood",
     "steel": "metal",
@@ -208,88 +201,86 @@ MATERIAL_KEYWORDS = {
     "fabric", "cloth", "leather"
 }
 
-WRITE_TEXT_PHRASES = ["write", "type", "print", "put text", "add text"]
-MATERIAL_INTENT_PHRASES = ["turn it", "turn this", "turn that"]
+WRITE_TEXT_PHRASES = [
+    "write", "type", "print", "put text", "add text"
+]
+
+
+# If user says these, they mean "apply to current object", not generate a new object
+MATERIAL_INTENT_PHRASES = [
+    #"set material", "change material", "apply material", "material to",
+   #"set texture", "change texture", "apply texture", "texture to",
+    #"make it", "make this", "make that",
+    #"apply", "overlay", "cover", "coat",
+    "turn it", "turn this", "turn that",
+]
+
+# Words that usually indicate a NEW object generation request (optional heuristic)
 GENERATION_OBJECT_WORDS = [
     "chair", "table", "sofa", "lamp", "ball", "cube", "box", "robot",
     "house", "car", "tree", "bottle", "phone", "mug", "cup", "vase", "poster"
 ]
 
-
-# =========================
-# FILLER / NOISE FILTER
-# =========================
-
-FILLER_WORDS = {
-    "yes", "no", "ok", "okay", "yeah", "yep", "nope", "sure", "right",
-    "hmm", "uh", "um", "ah", "oh", "eh", "huh", "hi", "hello",
-    "bye", "thanks", "thank", "you", "please", "sorry", "what",
-    "alright", "fine", "good", "great", "nice", "cool", "wow",
-}
-
-def _is_filler_transcript(text: str) -> bool:
-    """Return True if the transcript is just noise/filler and not a real command."""
-    cleaned = re.sub(r"[^a-z\s]", "", text.lower())
-    words = [w for w in cleaned.split() if w]
-    if not words:
-        return True
-    unique = set(words)
-    non_fillers = unique - FILLER_WORDS
-    # All words are filler words
-    if not non_fillers:
-        return True
-    # Single unique word repeated 3+ times (e.g. "yes yes yes yes")
-    if len(unique) == 1 and len(words) >= 3:
-        return True
-    # Two or fewer unique words, all filler (e.g. "yes yes ok ok")
-    if len(unique) <= 2 and not non_fillers:
-        return True
-    return False
-
-
 def _looks_like_write_text_request(text: str) -> bool:
     if not text:
         return False
     tl = text.lower()
+    # wall intent + some write verb
     return ("wall" in tl) and any(p in tl for p in WRITE_TEXT_PHRASES)
-
 
 def _extract_write_text_payload(text: str) -> Dict[str, Any]:
     t = (text or "").strip()
+
+    # Default
     msg = ""
     size = 60
 
+    # 1) Prefer quoted text
     m = re.search(r"['\"]([^'\"]+)['\"]", t)
     if m:
         msg = m.group(1).strip()
     else:
-        for sep in [".", ":", "-", "\u2014"]:
+        # 2) If there is a clear separator, take what comes after it
+        # Works for: "Write text on this wall. Hello Netherlands."
+        #            "Write text on the wall: Hello Netherlands"
+        #            "Write text on wall - Hello Netherlands"
+        for sep in [".", ":", "-", "—"]:
             if sep in t:
                 parts = [p.strip() for p in t.split(sep) if p.strip()]
                 if len(parts) >= 2:
                     msg = parts[-1].strip()
                     break
+
+        # 3) If still empty, try classic pattern: write <msg> on the wall
         if not msg:
             m2 = re.search(
                 r"\b(?:write|type|print|put text|add text)\b\s+(.*?)\s+\b(?:on|to)\b\s+(?:the\s+)?wall\b",
-                t, flags=re.IGNORECASE
+                t,
+                flags=re.IGNORECASE
             )
             if m2:
                 msg = m2.group(1).strip()
+
+        # 4) If STILL empty, remove leading instruction phrase if present
         if not msg:
+            # remove "write text on this wall" / "write on the wall" etc. from start
             msg = re.sub(
-                r"^\s*(?:write|type|print|put text|add text)\s*(?:text\s*)?(?:on|to)\s*(?:this|the)?\s*wall\s*[:,\-\u2013\u2014]?\s*",
-                "", t, flags=re.IGNORECASE
+                r"^\s*(?:write|type|print|put text|add text)\s*(?:text\s*)?(?:on|to)\s*(?:this|the)?\s*wall\s*[:,\-–—]?\s*",
+                "",
+                t,
+                flags=re.IGNORECASE
             ).strip()
 
+    # Cleanup extra words if they slipped in
     msg = re.sub(r"\b(on|to)\b\s+(?:this|the\s+)?wall\b", "", msg, flags=re.IGNORECASE).strip()
     msg = re.sub(r"\s+", " ", msg).strip()
 
+    # Font size parsing
     ms = re.search(r"\b(?:font\s*size|size)\s*(\d{2,3})\b", t, flags=re.IGNORECASE)
     if ms:
         try:
             size = int(ms.group(1))
-        except Exception:
+        except:
             size = 60
     size = max(10, min(200, size))
 
@@ -297,6 +288,9 @@ def _extract_write_text_payload(text: str) -> Dict[str, Any]:
         msg = "Hello World"
 
     return {"text": msg, "font_size": size}
+
+
+
 
 
 def _extract_material_keyword(text: str) -> Optional[str]:
@@ -310,96 +304,78 @@ def _extract_material_keyword(text: str) -> Optional[str]:
 
 
 def _looks_like_material_overlay_request(text: str) -> Optional[str]:
+    """
+    If user is clearly asking to change the texture/material of the CURRENT (gazed) object,
+    return the material keyword. Otherwise return None.
+    """
     if not text:
         return None
+
     tl = text.lower().strip()
     mat = _extract_material_keyword(tl)
     if not mat:
         return None
+
     has_material_intent_phrase = any(p in tl for p in MATERIAL_INTENT_PHRASES)
     has_pronoun_target = any(w in tl.split() for w in ["it", "this", "that"])
     mentions_object_noun = any(w in tl for w in GENERATION_OBJECT_WORDS)
+
+    # If it sounds like "apply to existing" and doesn't clearly mention a new object => overlay
     if (has_material_intent_phrase or has_pronoun_target) and not mentions_object_noun:
         return mat
+
+    # Explicit commands always mean overlay
     if "set material" in tl or "change material" in tl or "set texture" in tl or "change texture" in tl:
         return mat
+
     return None
 
 
 # =========================
-# POSTER INTENT HELPERS
+# POSTER INTENT HELPERS ✅
 # =========================
-
 POSTER_PHRASES = [
-    "image on the wall", "put an image", "put a picture", "hang a poster",
-    "generate a poster", "create a poster", "make a poster", "wall poster",
-    "put a poster", "add a poster", "place a poster"
-    # ← removed bare "poster" — too broad, matches "move this poster"
+    "poster", "image on the wall", "put an image", "put a picture", "hang a poster",
+    "generate a poster", "create a poster", "make a poster", "wall poster"
 ]
-
-MOVEMENT_WORDS = ["move", "translate", "shift", "push", "pull", "slide", "up", "down", "left", "right", "forward", "back"]
 
 def _looks_like_poster_request(text: str) -> bool:
     if not text:
         return False
     tl = text.lower()
-    # If it's a movement command, don't treat it as a poster creation request
-    if any(w in tl for w in MOVEMENT_WORDS):
-        return False
     return any(p in tl for p in POSTER_PHRASES)
 
 def _extract_size_meters(text: str) -> Optional[Dict[str, float]]:
+    """
+    Extract sizes like:
+    - "2m by 3m"
+    - "2 by 3 meters"
+    - "1 meter by 1 meter"
+    - "2 x 3 m"
+    Returns {"width_m": w, "height_m": h} or None.
+    """
     if not text:
         return None
     tl = text.lower().replace("meters", "m").replace("meter", "m")
+
+    # patterns like "2m by 3m", "2 by 3 m", "2 x 3m"
     m = re.search(r"(\d+(?:\.\d+)?)\s*m?\s*(?:x|by)\s*(\d+(?:\.\d+)?)\s*m", tl)
     if not m:
         m = re.search(r"(\d+(?:\.\d+)?)\s*(?:x|by)\s*(\d+(?:\.\d+)?)\s*m", tl)
+
     if not m:
         return None
+
     try:
-        w = max(0.1, min(20.0, float(m.group(1))))
-        h = max(0.1, min(20.0, float(m.group(2))))
+        w = float(m.group(1))
+        h = float(m.group(2))
+        # sanity clamp
+        w = max(0.1, min(20.0, w))
+        h = max(0.1, min(20.0, h))
         return {"width_m": w, "height_m": h}
-    except Exception:
+    except:
         return None
 
-
-# =========================
-# TEXTURE INTENT HELPERS
-# =========================
-
-TEXTURE_PHRASES = [
-    "texture", "wall texture", "pattern", "tileable", "seamless",
-    "make it look like", "cover the wall", "wallpaper"
-]
-
-
-def _looks_like_texture_request(text: str) -> bool:
-    if not text:
-        return False
-    tl = text.lower()
-    if any(p in tl for p in TEXTURE_PHRASES):
-        return True
-    if "wall" in tl and any(w in tl for w in ["bricks", "brick", "wood", "marble", "stone", "concrete", "flowers", "floral"]):
-        return True
-    return False
-
-
-def _extract_texture_prompt(text: str) -> str:
-    t = (text or "").strip()
-    t = re.sub(r"\b(generate|create|make|set|change|apply|put|add|give)\b", " ", t, flags=re.I)
-    t = re.sub(r"\b(a|an|the)\b", " ", t, flags=re.I)
-    t = re.sub(r"\b(texture|pattern|material|wallpaper)\b", " ", t, flags=re.I)
-    t = re.sub(r"\b(on|to|for)\b\s+(this|the)?\s*wall\b", " ", t, flags=re.I)
-    t = re.sub(r"\bmake\b\s+it\s+look\s+like\b", " ", t, flags=re.I)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t if t else "abstract pattern"
-
-
-# =========================
-# MESHY HELPERS
-# =========================
 
 def _meshy_headers() -> Dict[str, str]:
     if not MESHY_API_KEY:
@@ -412,11 +388,16 @@ def _meshy_headers() -> Dict[str, str]:
 
 
 def _meshy_create_task(mode: str, payload: Dict[str, Any]) -> str:
+    """
+    POST https://api.meshy.ai/openapi/v2/text-to-3d
+    Returns task id in {"result": "<id>"}.
+    """
     body = {"mode": mode, **payload}
     resp = requests.post(MESHY_TEXT2_3D_CREATE, headers=_meshy_headers(), json=body, timeout=60)
     if not resp.ok:
         print("[meshy] CREATE FAILED:", resp.status_code, resp.text, flush=True)
         resp.raise_for_status()
+
     data = resp.json()
     task_id = data.get("result")
     if not task_id:
@@ -425,6 +406,9 @@ def _meshy_create_task(mode: str, payload: Dict[str, Any]) -> str:
 
 
 def _meshy_get_task(task_id: str) -> Dict[str, Any]:
+    """
+    GET https://api.meshy.ai/openapi/v2/text-to-3d/:id
+    """
     url = f"{MESHY_TEXT2_3D_GET}/{task_id}"
     resp = requests.get(url, headers=_meshy_headers(), timeout=60)
     if not resp.ok:
@@ -443,10 +427,12 @@ def _download_to_file(url: str, out_path: str):
 
 
 def _set_job_progress(safe: str, stage: str, task_id: str, meshy_status: str, progress: Any):
+    # Keep ONLY what Unity needs: status + progress
     try:
         p = int(progress) if progress is not None else 0
     except Exception:
         p = 0
+
     jobs[safe] = {
         "stage": stage,
         "task_id": task_id,
@@ -465,62 +451,89 @@ def _generate_with_meshy_background(prompt: str, name: str, stage: str, art_styl
         if not MESHY_API_KEY:
             raise RuntimeError("MESHY_API_KEY not set (use env var MESHY_API_KEY).")
 
+        # Initialize job
         jobs[safe] = {
-            "status": "RUNNING", "stage": stage, "task_id": None,
-            "meshy_status": "PENDING", "progress": 0, "error": "",
+            "status": "RUNNING",
+            "stage": stage,
+            "task_id": None,
+            "meshy_status": "PENDING",
+            "progress": 0,
+            "error": "",
         }
 
+        # 1) Create preview task
         preview_task_id = _meshy_create_task(
             mode="preview",
-            payload={"prompt": prompt, "art_style": art_style, "should_remesh": True},
+            payload={
+                "prompt": prompt,
+                "art_style": art_style,
+                "should_remesh": True,
+            },
         )
+
         _set_job_progress(safe, stage, preview_task_id, "PENDING", 0)
 
+        # 2) Poll preview
         preview_task = None
-        deadline = time.time() + 20 * 60
+        deadline = time.time() + 20 * 60  # 20 minutes
         while time.time() < deadline:
             t = _meshy_get_task(preview_task_id)
             meshy_status = t.get("status") or "PENDING"
             progress = t.get("progress") or 0
+
             _set_job_progress(safe, stage, preview_task_id, meshy_status, progress)
             print(f"[meshy] preview {preview_task_id} status={meshy_status} progress={progress}", flush=True)
+
             if meshy_status == "SUCCEEDED" and t.get("model_urls", {}).get("glb"):
                 preview_task = t
                 break
+
             if meshy_status in ("FAILED", "CANCELED"):
                 raise RuntimeError(f"Meshy preview failed: {t.get('task_error') or t}")
+
             time.sleep(3)
 
         if preview_task is None:
             raise RuntimeError("Timed out waiting for Meshy preview task.")
 
+        # Preview-only -> download and finish
         if (stage or "").lower() == "preview":
             glb_url = preview_task["model_urls"]["glb"]
             _download_to_file(glb_url, out_glb)
+
             jobs[safe]["status"] = "DONE"
             jobs[safe]["meshy_status"] = "SUCCEEDED"
             jobs[safe]["progress"] = 100
             return
 
+        # 3) Refine
         refine_task_id = _meshy_create_task(
             mode="refine",
-            payload={"preview_task_id": preview_task_id, "enable_pbr": True},
+            payload={
+                "preview_task_id": preview_task_id,
+                "enable_pbr": True,
+            },
         )
+
         _set_job_progress(safe, stage, refine_task_id, "PENDING", 0)
 
         refine_task = None
-        deadline = time.time() + 30 * 60
+        deadline = time.time() + 30 * 60  # 30 minutes
         while time.time() < deadline:
             t = _meshy_get_task(refine_task_id)
             meshy_status = t.get("status") or "PENDING"
             progress = t.get("progress") or 0
+
             _set_job_progress(safe, stage, refine_task_id, meshy_status, progress)
             print(f"[meshy] refine {refine_task_id} status={meshy_status} progress={progress}", flush=True)
+
             if meshy_status == "SUCCEEDED" and t.get("model_urls", {}).get("glb"):
                 refine_task = t
                 break
+
             if meshy_status in ("FAILED", "CANCELED"):
                 raise RuntimeError(f"Meshy refine failed: {t.get('task_error') or t}")
+
             time.sleep(3)
 
         if refine_task is None:
@@ -528,6 +541,7 @@ def _generate_with_meshy_background(prompt: str, name: str, stage: str, art_styl
 
         glb_url = refine_task["model_urls"]["glb"]
         _download_to_file(glb_url, out_glb)
+
         jobs[safe]["status"] = "DONE"
         jobs[safe]["meshy_status"] = "SUCCEEDED"
         jobs[safe]["progress"] = 100
@@ -535,9 +549,12 @@ def _generate_with_meshy_background(prompt: str, name: str, stage: str, art_styl
     except Exception as e:
         print("[meshy] ERROR:", e, flush=True)
         jobs[safe] = {
-            "status": "ERROR", "stage": stage,
+            "status": "ERROR",
+            "stage": stage,
             "task_id": jobs.get(safe, {}).get("task_id"),
-            "meshy_status": "FAILED", "progress": 0, "error": str(e),
+            "meshy_status": "FAILED",
+            "progress": 0,
+            "error": str(e),
         }
 
 
@@ -564,40 +581,62 @@ def text_to_3d(req: TextTo3DRequest, background_tasks: BackgroundTasks):
             content={"status": "FAILED", "progress": 0, "message": "MESHY_API_KEY missing."},
         )
 
+    # Already generated?
     if os.path.exists(glb_path):
-        return JSONResponse(status_code=200, content={
-            "status": "SUCCEEDED", "progress": 100,
-            "downloadUrl": f"http://localhost:8000/files/{glb_filename}",
-        })
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "SUCCEEDED",
+                "progress": 100,
+                "downloadUrl": f"http://localhost:8000/files/{glb_filename}",
+            },
+        )
 
+    # If job exists, report ONLY status + progress (minimal)
     job = jobs.get(safe)
     if job and job.get("status") == "RUNNING":
-        return JSONResponse(status_code=202, content={
-            "status": job.get("meshy_status", "IN_PROGRESS"),
-            "progress": int(job.get("progress", 0) or 0),
-        })
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": job.get("meshy_status", "IN_PROGRESS"),
+                "progress": int(job.get("progress", 0) or 0),
+            },
+        )
 
     if job and job.get("status") == "ERROR":
-        return JSONResponse(status_code=500, content={
-            "status": "FAILED", "progress": 0,
-            "message": job.get("error", "Unknown error"),
-        })
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "FAILED",
+                "progress": 0,
+                "message": job.get("error", "Unknown error"),
+            },
+        )
 
+    # Start new job
     stage = (req.stage or "preview").lower()
     art_style = (req.art_style or "realistic").lower()
-    print(f"[text-to-3d] starting name={req.name} safe={safe} stage={stage} art_style={art_style}", flush=True)
+    print(f"[text-to-3d] starting Meshy job name={req.name} safe={safe} stage={stage} art_style={art_style}", flush=True)
 
     jobs[safe] = {
-        "status": "RUNNING", "stage": stage, "task_id": None,
-        "meshy_status": "PENDING", "progress": 0, "error": "",
+        "status": "RUNNING",
+        "stage": stage,
+        "task_id": None,
+        "meshy_status": "PENDING",
+        "progress": 0,
+        "error": "",
     }
 
     background_tasks.add_task(_generate_with_meshy_background, req.prompt, req.name, stage, art_style)
-    return JSONResponse(status_code=202, content={"status": "PENDING", "progress": 0})
+
+    return JSONResponse(
+        status_code=202,
+        content={"status": "PENDING", "progress": 0},
+    )
 
 
 # =========================
-# Poster Image Endpoint
+# Poster Image Endpoint (NEW)
 # =========================
 
 class PosterImageRequest(BaseModel):
@@ -605,10 +644,20 @@ class PosterImageRequest(BaseModel):
     width_px: int = 1024
     height_px: int = 1024
 
-
 @app.post("/api/poster-image")
 def poster_image(req: PosterImageRequest):
-    prompt = (req.prompt or "").strip() or "A minimal poster"
+    """
+    Returns:
+      { "image_url": "http://localhost:8000/posters/poster_....png" }
+
+    Currently generates a placeholder image with text.
+    Later you can replace _make_placeholder_poster(...) with a call to Stable Diffusion / DALL·E / etc.
+    """
+    prompt = (req.prompt or "").strip()
+    if not prompt:
+        prompt = "A minimal poster"
+
+    # clamp pixel sizes to avoid huge images
     w = max(256, min(2048, int(req.width_px or 1024)))
     h = max(256, min(2048, int(req.height_px or 1024)))
 
@@ -616,16 +665,17 @@ def poster_image(req: PosterImageRequest):
     filename = f"poster_{ts}.png"
     out_path = os.path.join(POSTER_DIR, filename)
 
-    # _make_placeholder_poster(prompt, out_path, w, h)  # fallback, do not delete
+#    _make_placeholder_poster(prompt, out_path, w, h)         ## dont delete it, I may need later to generate text
     _make_ai_poster(prompt, out_path, w, h)
 
-    return JSONResponse(content={"image_url": f"http://localhost:8000/posters/{filename}"})
 
-
+    return JSONResponse(content={
+        "image_url": f"http://localhost:8000/posters/{filename}"
+    })
+    
 class TextureImageRequest(BaseModel):
     prompt: str
     size_px: int = 1024
-
 
 @app.post("/api/texture-image")
 def texture_image(req: TextureImageRequest):
@@ -637,109 +687,131 @@ def texture_image(req: TextureImageRequest):
     out_path = os.path.join(TEXTURE_DIR, filename)
 
     _make_ai_texture(prompt, out_path, size_px=size_px)
-    return JSONResponse(content={"image_url": f"http://localhost:8000/textures/{filename}"})
+
+    return JSONResponse(content={
+        "image_url": f"http://localhost:8000/textures/{filename}"
+    })    
+
+
+def _make_placeholder_poster(prompt: str, out_path: str, w: int, h: int):
+    img = Image.new("RGB", (w, h), (245, 245, 245))
+    draw = ImageDraw.Draw(img)
+
+    # border
+    draw.rectangle([8, 8, w - 8, h - 8], outline=(40, 40, 40), width=4)
+
+    # simple wrapped text
+    text = (prompt or "Poster").strip()
+    text = text[:220]
+
+    max_chars = 38 if w >= h else 30
+    lines = [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
+
+    y = 40
+    for ln in lines[:12]:
+        draw.text((30, y), ln, fill=(20, 20, 20))
+        y += 28
+
+    img.save(out_path, "PNG")
 
 
 # =========================
 # Voice -> Commands
 # =========================
 
+# =========================
+# TEXTURE INTENT HELPERS ✅
+# =========================
+TEXTURE_PHRASES = [
+    "texture", "wall texture", "pattern", "tileable", "seamless",
+    "make it look like", "cover the wall", "wallpaper"
+]
+
+def _looks_like_texture_request(text: str) -> bool:
+    if not text:
+        return False
+    tl = text.lower()
+
+    # must mention wall/texture-ish context
+    if any(p in tl for p in TEXTURE_PHRASES):
+        return True
+
+    # common phrasing: "make this wall bricks", "turn this wall into marble"
+    if "wall" in tl and any(w in tl for w in ["bricks", "brick", "wood", "marble", "stone", "concrete", "flowers", "floral"]):
+        return True
+
+    return False
+
+def _extract_texture_prompt(text: str) -> str:
+    t = (text or "").strip()
+
+    # remove instruction words but keep the actual description
+    t = re.sub(r"\b(generate|create|make|set|change|apply|put|add|give)\b", " ", t, flags=re.I)
+    t = re.sub(r"\b(a|an|the)\b", " ", t, flags=re.I)
+    t = re.sub(r"\b(texture|pattern|material|wallpaper)\b", " ", t, flags=re.I)
+    t = re.sub(r"\b(on|to|for)\b\s+(this|the)?\s*wall\b", " ", t, flags=re.I)
+    t = re.sub(r"\bmake\b\s+it\s+look\s+like\b", " ", t, flags=re.I)
+    t = re.sub(r"\s+", " ", t).strip()
+
+    return t if t else "abstract pattern"
+
+
 def extract_commands(text: str) -> dict:
 
     overall_start = time.time()
-
-    def _done(result: dict, label: str = "fast-path") -> dict:
-        elapsed = time.time() - overall_start
-        print(f"[extract] {label}: {elapsed:.3f}s", flush=True)
-        return result
-
+    
     if not text or text.strip() == "":
-        return _done({"commands": [{"action": "no_action"}]}, "empty-input")
-
-    # ---- FILLER / NOISE FILTER ----
-    if _is_filler_transcript(text):
-        print(f"[extract] filler/noise transcript ignored: '{text}'", flush=True)
-        return _done({"commands": [{"action": "no_action"}]}, "filler-input")
-
-    # ---- FAST PATH: translate (reliable axis mapping, no LLM needed) ----
-    def _try_translate_fast_path(t: str):
-        tl = t.lower().strip()
-        move_words = ["move", "translate", "shift", "push", "pull", "slide"]
-        dir_words   = ["left", "right", "up", "down", "forward", "back", "backward", "front"]
-        if not any(w in tl for w in move_words + dir_words):
-            return None
-        # Must have at least one direction word to be confident
-        if not any(w in tl for w in dir_words):
-            return None
-
-        # Extract distance — check for cm first, then plain number
-        dist = 0.2  # default if no number given
-        cm_m = re.search(r"(\d+(?:\.\d+)?)\s*cm\b", tl)
-        m_m  = re.search(r"(\d+(?:\.\d+)?)\s*(?:meter|metre|m\b)", tl)
-        plain_m = re.search(r"(\d+(?:\.\d+)?)", tl)
-        if cm_m:
-            dist = float(cm_m.group(1)) * 0.01
-        elif m_m:
-            dist = float(m_m.group(1))
-        elif plain_m:
-            dist = float(plain_m.group(1))
-
-        dx = dy = dz = 0.0
-        # left/right → dx only
-        if re.search(r"\bright\b", tl):  dx = dist
-        elif re.search(r"\bleft\b", tl): dx = -dist
-        # up/down → dy only
-        if re.search(r"\bup\b", tl):     dy = dist
-        elif re.search(r"\bdown\b", tl): dy = -dist
-        # forward/back → dz only
-        if re.search(r"\b(forward|front)\b", tl):        dz = dist
-        elif re.search(r"\b(back|backward|behind)\b", tl): dz = -dist
-
-        if dx == 0.0 and dy == 0.0 and dz == 0.0:
-            return None  # direction unclear — let LLM handle
-
-        return {"commands": [{"action": "translate", "target": "cube",
-                               "dx": dx, "dy": dy, "dz": dz}]}
-
-    translate_result = _try_translate_fast_path(text)
-    if translate_result:
-        return _done(translate_result, "translate-fast-path")
-
-    # ---- HARD OVERRIDES (no LLM needed) ----
-
+        return {"commands": [{"action": "no_action"}]}
+        
+    # ✅ HARD OVERRIDE FIRST:
+    # If user says "make it wood / set material to metal / change texture to marble"
+    # we DO NOT call the LLM, so it never accidentally outputs generate_model("wood").
+    
+        
+    tl = text.lower()
+    
+    
     if _looks_like_texture_request(text):
         user_tex = _extract_texture_prompt(text)
-        return _done({"commands": [{
+        return {"commands": [{
             "action": "set_wall_texture",
             "texture_prompt": f"seamless tileable texture of {user_tex}, realistic, no perspective, even lighting, no text",
             "tile_scale": 1.8
-        }]}, "texture")
+    }]}
+    
+    #if ("texture" in tl or "look like" in tl or "make" in tl):
+    #    return {"commands":[{"action":"set_wall_texture","texture_prompt":"seamless tileable texture, realistic, no perspective","tile_scale":1.8}]}
 
     mat = _looks_like_material_overlay_request(text)
     if mat:
-        return _done({"commands": [{"action": "set_material", "target": "cube", "material": mat}]}, "material")
+        return {"commands": [{"action": "set_material", "target": "cube", "material": mat}]}
 
+    # ✅ HARD OVERRIDE FOR POSTERS (fast + reliable)
+    # If user clearly asks for poster/image on wall, we can still call LLM (better prompts),
+    # but this makes it work even if LLM fails.
     if _looks_like_poster_request(text):
         size = _extract_size_meters(text) or {"width_m": 1.0, "height_m": 1.0}
-        return _done({"commands": [{
+        # Use the full text as image prompt (good enough for MVP)
+        return {"commands": [{
             "action": "create_poster",
             "width_m": float(size["width_m"]),
             "height_m": float(size["height_m"]),
             "image_prompt": text
-        }]}, "poster")
-
+        }]}
+        
     if _looks_like_write_text_request(text):
         payload = _extract_write_text_payload(text)
-        return _done({"commands": [{
+        return {"commands": [{
             "action": "write_text",
             "text": payload["text"],
             "font_size": payload["font_size"]
-        }]}, "write-text")
-
-    # ---- LLM PATH ----
+        }]}        
 
     desired_obj = _infer_object_phrase(text)
     desired_name = _slug_to_name(desired_obj)
+    
+    t0 = time.time()
+    
 
     prompt = f"""
 You are an AI command generator for a Unity XR scene.
@@ -763,56 +835,10 @@ Supported actions (you may output multiple in sequence):
 4) stack_on_next: {{"action":"stack_on_next"}}
 5) set_color: {{"action":"set_color","target":"cube","color":"red"}}
 6) set_material: {{"action":"set_material","target":"cube","material":"wood"}}
-
-7) translate (move relatively): {{"action":"translate","target":"cube","dx":0.0,"dy":0.2,"dz":0.0}}
-   - Applies to ANY gazed object, including posters, models, and cubes.
-   - AXIS RULES — always output all three fields (dx, dy, dz). Set unused axes to exactly 0.0.
-   - left/right  → dx ONLY.  right=positive dx, left=negative dx.  dy=0.0, dz=0.0
-   - up/down     → dy ONLY.  up=positive dy,    down=negative dy.  dx=0.0, dz=0.0
-   - forward/back→ dz ONLY.  forward=positive dz, back=negative dz. dx=0.0, dy=0.0
-   - NEVER put a left/right value into dz. NEVER put a forward/back value into dx.
-   Examples (all axes always shown):
-   - "2 meters to the right" -> dx=2.0,  dy=0.0, dz=0.0
-   - "1 meter left"          -> dx=-1.0, dy=0.0, dz=0.0
-   - "1 meter forward"       -> dx=0.0,  dy=0.0, dz=1.0
-   - "1 meter back"          -> dx=0.0,  dy=0.0, dz=-1.0
-   - "50cm up"               -> dx=0.0,  dy=0.5, dz=0.0
-   - "50cm down"             -> dx=0.0,  dy=-0.5, dz=0.0
-   - If no distance given ("move a bit left", "slightly up", "move left") -> use 0.2 as distance.
-   - POSTER MOVEMENT: "move the poster forward/back/left/right/up/down" -> translate
-
-8) scale (two sub-cases only):
-   {{"action":"scale","target":"cube","axis":"y","delta":1.0}}
-
-   Choose exactly ONE sub-case:
-
-   a) DIRECTIONAL (per-axis): user says "scale/stretch/extend/shrink up/down/left/right/forward/back"
-      Fields: axis + delta
-      axis mapping:
-        up / upward              -> axis="y", delta=+X
-        down / downward          -> axis="y", delta=-X
-        left                     -> axis="x", delta=-X
-        right                    -> axis="x", delta=+X
-        forward / front          -> axis="z", delta=+X
-        backward / back          -> axis="z", delta=-X
-      - If no distance is given ("scale up a bit", "stretch it left", just "scale upward") -> use 0.2 as delta.
-      Examples:
-        "scale up a bit"               -> {{"action":"scale","target":"cube","axis":"y","delta":0.2}}
-        "scale 1 meter upward"         -> {{"action":"scale","target":"cube","axis":"y","delta":1.0}}
-        "scale 50cm downward"          -> {{"action":"scale","target":"cube","axis":"y","delta":-0.5}}
-        "extend 2 meters to the right" -> {{"action":"scale","target":"cube","axis":"x","delta":2.0}}
-        "shrink 1 meter forward"       -> {{"action":"scale","target":"cube","axis":"z","delta":1.0}}
-
-   b) RELATIVE UNIFORM: user says bigger/smaller/shrink/grow with NO specific direction
-      Fields: factor only (no axis)
-      factor < 1 = shrink, factor > 1 = grow
-      - If no factor amount is implied ("a bit bigger", "slightly smaller") -> use factor=1.2 for grow, 0.8 for shrink.
-      Examples:
-        "make it a bit bigger" -> {{"action":"scale","target":"cube","factor":1.2}}
-        "make it bigger"       -> {{"action":"scale","target":"cube","factor":1.3}}
-        "shrink it a bit"      -> {{"action":"scale","target":"cube","factor":0.8}}
-        "shrink it"            -> {{"action":"scale","target":"cube","factor":0.7}}
-
+7) move: {{"action":"move","target":"cube","x":0.0,"y":1.0,"z":-0.5,"space":"world"}}
+8) translate: {{"action":"translate","target":"cube","dx":0.0,"dy":0.2,"dz":0.0,"space":"world"}}
+9) set_scale: {{"action":"set_scale","target":"cube","uniform":1.5}}
+10) scale_by: {{"action":"scale_by","target":"cube","factor":0.7}}
 11) place_on_floor: {{"action":"place_on_floor","target":"cube"}}
 
 12) generate_model:
@@ -824,22 +850,6 @@ Supported actions (you may output multiple in sequence):
    Create an image poster and place it on the gazed wall surface.
    Template:
    {{"action":"create_poster","width_m":2.0,"height_m":3.0,"image_prompt":"a vintage travel poster of Amsterdam canals"}}
-   
-14) run_code:
-   If the user describes something they want an object TO DO
-   (rotate, spin, walk, bounce, follow, orbit, animate, patrol, etc.),
-   return:
-   {{"action":"run_code","behaviour_prompt":"<clear technical restatement of the behaviour>","target":"<object name if mentioned, else empty string>"}}
-
-Examples:
-"make the cube rotate slowly"
--> {{"commands":[{{"action":"run_code","behaviour_prompt":"Rotate the selected cube continuously around the Y axis at a slow speed.","target":"cube"}}]}}
-
-"make the human walk in a circle"
--> {{"commands":[{{"action":"run_code","behaviour_prompt":"Make the human walk continuously in a circle at a natural walking speed.","target":"human"}}]}}
-
-"make it bounce"
--> {{"commands":[{{"action":"run_code","behaviour_prompt":"Make the selected object bounce up and down continuously.","target":""}}]}}
 
 MODEL GENERATION RULES:
 - Ignore the phrases "start recording" and "stop recording" if they appear.
@@ -859,68 +869,47 @@ POSTER RULES:
 - If user doesn't specify size, default width_m=1.0 height_m=1.0
 - The image_prompt should describe what the poster should show.
 - DO NOT use set_material for posters.
-- If the user says "move the poster forward/back/left/right/up/down", use translate (NOT create_poster).
 
 SCALING RULES (IMPORTANT):
-- All scaling uses action="scale". Pick exactly one sub-case:
-  a) Direction + number given ("1 meter upward/left/forward/etc.") -> use axis + delta fields
-  b) No direction, no specific number ("bigger", "smaller")        -> use factor field only
-- Never mix sub-cases (never include both axis and factor in the same command).
-
-Distinguish carefully:
-- One-time positional edits use translate.
-Examples:
-"make the cube rotate slowly"
--> {{"commands":[{{"action":"run_code","behaviour_prompt":"Rotate the selected cube continuously around the Y axis at a slow speed.","target":"cube"}}]}}
-
-"make the human walk in a circle"
--> {{"commands":[{{"action":"run_code","behaviour_prompt":"Make the human walk continuously in a circle at a natural walking speed.","target":"human"}}]}}
-
-"make it bounce"
--> {{"commands":[{{"action":"run_code","behaviour_prompt":"Make the selected object bounce up and down continuously.","target":""}}]}}
-
+- If user specifies an absolute target size like "to 2.1" or "to 0.01" or "scale to X":
+  -> output ONLY: {{"action":"set_scale","target":"cube","uniform": X}}
+  -> DO NOT output scale_by in the same response.
+- Use scale_by ONLY when user does NOT specify a numeric target.
+  - If user says decrease/smaller/shrink => factor must be < 1 (e.g., 0.8)
+  - If user says increase/bigger/grow => factor must be > 1 (e.g., 1.2)
+- Never output both set_scale and scale_by for the same user utterance.
 
 Rules:
-- If there is no clear actionable edit — including if the user says filler words like
-  "yes", "no", "ok", "yeah", "hmm", "uh", "thanks", or repeats a word —
-  return ONLY: {{"commands":[{{"action":"no_action"}}]}}
-- NEVER invent a command from ambiguous or non-command input.
-- Output ONLY the JSON object. No explanation, no markdown, no extra text.
+- If there is no clear actionable edit, return:
+  {{"commands":[{{"action":"no_action"}}]}}
 
 User: "{text}"
 """
 
-    t_llm_start = time.time()
-
+    t2 = time.time()
+    
     try:
         resp = requests.post(
             "http://localhost:11434/api/generate",
-            json={"model": "llama3.2:latest", "prompt": prompt, "stream": False, "keep_alive": "60m"},
+            json={"model": "llama3.2:latest", "prompt": prompt, "stream": False},
             timeout=30
         )
         resp.raise_for_status()
         data = resp.json()
         raw = (data.get("response", "") or "").strip()
-
-        print(f"[extract] LLM request time: {time.time() - t_llm_start:.3f}s", flush=True)
+        
+        t3 = time.time()
+        print(f"[extract] LLM request time: {t3 - t2:.3f}s", flush=True)
 
         m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
         if not m:
-            return _done({"commands": [{"action": "no_action"}]}, "llm-no-json")
+            return {"commands": [{"action": "no_action"}]}
 
-        raw_json = m.group(0)
-
-        try:
-            obj = json.loads(raw_json)
-        except json.JSONDecodeError:
-            decoder = json.JSONDecoder()
-            obj, _ = decoder.raw_decode(raw_json)
-
+        obj = json.loads(m.group(0))
         if not isinstance(obj, dict) or "commands" not in obj or not isinstance(obj["commands"], list):
-            return _done({"commands": [{"action": "no_action"}]}, "llm-bad-schema")
+            return {"commands": [{"action": "no_action"}]}
 
         normalized: List[Dict[str, Any]] = []
-        run_code_dispatched = False  # allow only one run_code per response
         for c in obj["commands"]:
             if not isinstance(c, dict):
                 continue
@@ -929,32 +918,11 @@ User: "{text}"
             if not action:
                 continue
 
-            # --- run_code handler ---
-            if action == "run_code":
-                if run_code_dispatched:
-                    print("[extract] Skipping duplicate run_code command.", flush=True)
-                    continue
-                behaviour_prompt = str(
-                    c.get("behaviour_prompt", c.get("prompt", text)) or ""
-                ).strip()
-
-                target = str(c.get("target", "") or "").strip()
-
-                if not behaviour_prompt:
-                    c = {"action": "no_action"}
-                    action = "no_action"
-                else:
-                    c = {
-                        "action": "run_code",
-                        "behaviour_prompt": behaviour_prompt,
-                        "target": target
-                    }
-                    run_code_dispatched = True
-                    
             if action in ("no_action", "noaction", "none"):
                 action = "no_action"
 
-            if action in ("set_color", "set_material", "move", "translate", "scale", "place_on_floor"):
+            # Default target for gaze-based ops (Unity mostly ignores it, but we keep it consistent)
+            if action in ("set_color", "set_material", "move", "translate", "set_scale", "scale_by", "place_on_floor"):
                 c["target"] = str(c.get("target", "cube")).strip() or "cube"
 
             if action == "set_material":
@@ -971,6 +939,7 @@ User: "{text}"
                 c["stage"] = str(c.get("stage", "preview")).strip().lower() or "preview"
                 c["art_style"] = str(c.get("art_style", "realistic")).strip().lower() or "realistic"
 
+                # ✅ SAFETY: if LLM tries generate_model("wood") etc, convert to set_material if transcript fits
                 p_low = (c.get("prompt") or "").strip().lower()
                 if p_low in MATERIAL_KEYWORDS or p_low in MATERIAL_ALIASES:
                     mat2 = _looks_like_material_overlay_request(text)
@@ -978,12 +947,14 @@ User: "{text}"
                         normalized.append({"action": "set_material", "target": "cube", "material": mat2})
                         continue
 
+                # Special handling for "cube" request
                 p = c["prompt"].lower()
                 if p in ("cube", "a cube", "generate a cube", "make a cube", "create a cube"):
                     c["prompt"] = "simple cube"
                     if c["name"].lower().startswith("generated"):
                         c["name"] = "Cube_01"
 
+                # Guard against example leakage / mismatch
                 if _looks_like_example_leak(c["prompt"], c["name"]):
                     c["prompt"] = desired_obj
                     c["name"] = desired_name
@@ -997,105 +968,95 @@ User: "{text}"
                 if not c["prompt"]:
                     action = "no_action"
 
+            
             if action == "create_poster":
+                # defaults
                 try:
                     c["width_m"] = float(c.get("width_m", 1.0) or 1.0)
-                except Exception:
+                except:
                     c["width_m"] = 1.0
                 try:
                     c["height_m"] = float(c.get("height_m", 1.0) or 1.0)
-                except Exception:
+                except:
                     c["height_m"] = 1.0
+
+                # clamp meters
                 c["width_m"] = max(0.1, min(20.0, c["width_m"]))
                 c["height_m"] = max(0.1, min(20.0, c["height_m"]))
+
                 c["image_prompt"] = str(c.get("image_prompt", c.get("prompt", "")) or "").strip()
                 if not c["image_prompt"]:
                     c["image_prompt"] = text
+
+                # Optional: LLM may include image_url; keep it if present
                 if "image_url" in c and c["image_url"] is not None:
                     c["image_url"] = str(c["image_url"]).strip()
-
-            # Unified scale normalizer
-            if action == "scale":
-                axis = str(c.get("axis", "")).strip().lower()
-                axis_aliases = {
-                    "up": "y", "upward": "y", "down": "y", "downward": "y",
-                    "left": "x", "right": "x",
-                    "forward": "z", "front": "z", "backward": "z", "back": "z",
-                }
-                axis = axis_aliases.get(axis, axis)  # normalise word -> x/y/z
-
-                if axis in ("x", "y", "z"):
-                    # Sub-case a: directional
-                    try:
-                        delta = float(c.get("delta", 0.0))
-                    except Exception:
-                        delta = 0.0
-                    raw_axis_word = str(c.get("axis", "")).strip().lower()
-                    if raw_axis_word in ("down", "downward", "left", "backward", "back") and delta > 0:
-                        delta = -delta
-                    c = {"action": "scale", "target": c["target"], "axis": axis, "delta": delta}
-                    if delta == 0.0:
-                        action = "no_action"
-
-                else:
-                    # Sub-case b: relative uniform (factor only)
-                    try:
-                        factor = float(c.get("factor", 1.0))
-                    except Exception:
-                        factor = 1.0
-                    c = {"action": "scale", "target": c["target"], "factor": factor}
-                    if factor == 1.0:
-                        action = "no_action"
-
-                c["action"] = action
 
             c["action"] = action
             normalized.append(c)
 
         if not normalized:
-            return _done({"commands": [{"action": "no_action"}]}, "llm-empty")
+            return {"commands": [{"action": "no_action"}]}
 
-        # SAFETY: never let old action names through if LLM ignores the prompt
-        normalized = [
-            c for c in normalized
-            if str(c.get("action", "")).strip().lower() not in ("set_scale", "scale_by", "scale_axis")
-        ]
+        # SAFETY FILTER: If LLM returns BOTH set_scale and scale_by, prefer set_scale and drop scale_by.
+        has_set_scale = any(
+            isinstance(c, dict) and str(c.get("action", "")).strip().lower() == "set_scale"
+            for c in normalized
+        )
+        if has_set_scale:
+            normalized = [
+                c for c in normalized
+                if str(c.get("action", "")).strip().lower() != "scale_by"
+            ]
 
-        return _done({"commands": normalized}, "llm")
+        return {"commands": normalized}
 
     except Exception as e:
         print("Error calling LLM for commands:", e, flush=True)
-        return _done({"commands": [{"action": "no_action"}]}, "llm-error")
+        return {"commands": [{"action": "no_action"}]}
 
-
-# =========================
-# Transcribe Endpoint
-# =========================
 
 @app.post("/transcribe")
 async def transcribe(audio: UploadFile = File(...)):
+    #temp_path = os.path.join(DESKTOP_PATH, "temp_recording.wav")
     temp_path = os.path.join(BASE_PATH, "temp_recording.wav")
-
+    #temp_path = os.path.join(AUDIO_DIR, f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav")
+    
+    
     with open(temp_path, "wb") as f:
         f.write(await audio.read())
 
     print(f"[{datetime.now().isoformat(timespec='seconds')}] Transcribing {temp_path}...", flush=True)
+    
+    #segments, info = model.transcribe(temp_path, beam_size=5)         
+    #text = "".join(segment.text for segment in segments).strip() 
+    #print("Detected language:", info.language, "prob:", info.language_probability, flush=True)
+    
+    #if not text:
+    #    text = "[No speech recognized]"
 
+    #result = extract_commands(text)
+    
+    
+    # ---- Whisper timing ----
     t0 = time.time()
-    segments, info = model.transcribe(temp_path, beam_size=5, task="translate")
-    print(f"whisper: {time.time() - t0:.3f} sec", flush=True)
+    segments, info = model.transcribe(temp_path, beam_size=5)
+    print("whisper:", time.time() - t0, "sec", flush=True)
 
     text = "".join(segment.text for segment in segments).strip()
+
     print("Detected language:", info.language, "prob:", info.language_probability, flush=True)
 
     if not text:
         text = "[No speech recognized]"
 
+    # ---- Command extraction timing ----
     t1 = time.time()
     result = extract_commands(text)
-    print(f"extract_commands: {time.time() - t1:.3f} sec", flush=True)
+    print("extract_commands:", time.time() - t1, "sec", flush=True)
 
     commands = result.get("commands", [{"action": "no_action"}])
+    
 
     print("Transcript:", text, flush=True)
     print("Commands:", commands, flush=True)
@@ -1105,12 +1066,21 @@ async def transcribe(audio: UploadFile = File(...)):
         f.write(line + "\n")
 
     return JSONResponse(content={
-        "transcript": text,
-        "detected_language": info.language,
-        "language_probability": info.language_probability,
-        "commands": commands,
-        "command": commands[0] if commands else {"action": "no_action"}
+    "transcript": text,
+    "detected_language": info.language,
+    "language_probability": info.language_probability,
+    "commands": commands,
+    "command": commands[0] if commands else {"action": "no_action"}
     })
+
+
+@app.on_event("startup")
+def _print_routes():
+    print("=== Registered routes ===", flush=True)
+    for r in app.routes:
+        methods = getattr(r, "methods", None)
+        print(f"{getattr(r, 'path', '')}  {methods}", flush=True)
+    print("=========================", flush=True)
 
 
 if __name__ == "__main__":

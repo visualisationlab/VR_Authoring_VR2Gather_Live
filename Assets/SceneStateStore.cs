@@ -1,4 +1,4 @@
-﻿using UnityEngine;
+using UnityEngine;
 using System.Collections.Generic;
 using System.IO;
 
@@ -65,6 +65,10 @@ public class SceneStateStore : MonoBehaviour
         foreach (var p in posters)
         {
             if (p == null) continue;
+            // ✅ Sync world-space size back into widthMeters/heightMeters before
+            // capturing, so any scale changes made since the poster was created
+            // (via voice commands or gaze editor) are correctly persisted.
+            p.SyncSizeFromTransform();
             state.posters.Add(p.Capture());
         }
 

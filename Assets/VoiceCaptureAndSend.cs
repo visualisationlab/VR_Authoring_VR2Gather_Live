@@ -1,4 +1,4 @@
-﻿using UnityEngine;
+using UnityEngine;
 using UnityEngine.Networking;
 using System.Collections;
 using System.IO;
@@ -118,7 +118,6 @@ public class VoiceCaptureAndSend : MonoBehaviour
     private readonly Dictionary<int, Job> _jobs = new Dictionary<int, Job>();
     private readonly Dictionary<int, Coroutine> _modelPollRoutines = new Dictionary<int, Coroutine>();
 
-    // UPDATED: allow overriding startTime (so instant commands can time from "stop recording")
     private int StartJob(string type, string initialStatus, GameObject boundTarget, float startTimeOverride = -1f)
     {
         int id = ++_jobSeq;
@@ -173,11 +172,9 @@ public class VoiceCaptureAndSend : MonoBehaviour
         RefreshJobsUI();
     }
 
-    // waits one frame so "running" row is visible before completion
-    // AFTER:
     private IEnumerator FinishJobNextFrame(int jobId, bool ok, string reason = "")
     {
-        float capturedFinishTime = Time.realtimeSinceStartup; // ← capture BEFORE yield
+        float capturedFinishTime = Time.realtimeSinceStartup;
         yield return null;
         if (!_jobs.TryGetValue(jobId, out var j)) yield break;
 
@@ -194,8 +191,8 @@ public class VoiceCaptureAndSend : MonoBehaviour
             type = j.type,
             targetName = j.boundTarget != null ? j.boundTarget.name : "?",
             ok = ok,
-            startTime = j.startTime,            // ← stop-recording time (already set correctly)
-            finishTime = capturedFinishTime,      // ← actual dispatch time, not next-frame
+            startTime = j.startTime,
+            finishTime = capturedFinishTime,
             detail = string.IsNullOrWhiteSpace(reason) ? j.status : reason
         });
 
@@ -294,14 +291,12 @@ public class VoiceCaptureAndSend : MonoBehaviour
         public float font_size;
         public string texture_prompt;
         public float tile_scale;
-        public float x;
-        public float y;
-        public float z;
         public float dx;
         public float dy;
         public float dz;
-        public float uniform;
         public float factor;
+        public string axis;
+        public float delta;
         public string prompt;
         public string name;
         public string stage;
@@ -472,8 +467,7 @@ public class VoiceCaptureAndSend : MonoBehaviour
             case "set_color":
             case "move":
             case "translate":
-            case "set_scale":
-            case "scale_by":
+            case "scale":
             case "place_on_floor":
             case "set_material":
                 return true;
@@ -555,6 +549,18 @@ public class VoiceCaptureAndSend : MonoBehaviour
     }
 
     // =========================
+    // Scene search helper (case-insensitive)
+    // =========================
+    private GameObject FindGameObjectCaseInsensitive(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return null;
+        string lower = name.ToLowerInvariant();
+        foreach (var go in FindObjectsByType<GameObject>(FindObjectsSortMode.None))
+            if (go.name.ToLowerInvariant() == lower) return go;
+        return null;
+    }
+
+    // =========================
     // Recording
     // =========================
     public void StartRecording()
@@ -575,6 +581,11 @@ public class VoiceCaptureAndSend : MonoBehaviour
         Microphone.End(microphoneDevice);
         isRecording = false;
 
+        // Live gaze only (no remembered fallback) — used exclusively by run_code
+        // so it never accidentally attaches to a previously-looked-at object.
+        TryGetCurrentTargetObject(out GameObject liveGazeTarget);
+
+        // Full resolve (live + remembered) — used by all other commands
         GameObject commandTarget = ResolveCommandTarget();
         if (commandTarget != null) RememberTarget(commandTarget);
 
@@ -595,18 +606,17 @@ public class VoiceCaptureAndSend : MonoBehaviour
 
         byte[] wavData = AudioClipToWav(trimmedClip);
 
-        // UPDATED: Start a visible VOICE job immediately on stop-recording
         float requestStartTime = Time.realtimeSinceStartup;
         int voiceJobId = StartJob("voice", "UPLOADING", commandTarget, requestStartTime);
 
         SetHeaderLine("⏹ Processing...");
-        StartCoroutine(SendAudioToServer(wavData, commandTarget, commandWallAnchor, voiceJobId, requestStartTime));
+        StartCoroutine(SendAudioToServer(wavData, commandTarget, liveGazeTarget, commandWallAnchor, voiceJobId, requestStartTime));
     }
 
     // =========================
     // Server
     // =========================
-    IEnumerator SendAudioToServer(byte[] wavData, GameObject commandTarget, WallAnchor commandWallAnchor, int voiceJobId, float requestStartTime)
+    IEnumerator SendAudioToServer(byte[] wavData, GameObject commandTarget, GameObject liveGazeTarget, WallAnchor commandWallAnchor, int voiceJobId, float requestStartTime)
     {
         WWWForm form = new WWWForm();
         form.AddBinaryData("audio", wavData, "recording.wav", "audio/wav");
@@ -657,22 +667,15 @@ public class VoiceCaptureAndSend : MonoBehaviour
 
             if (result.commands != null && result.commands.Length > 0)
             {
-                bool hasRunnableCodeTarget = false;
-
+                // If any run_code command is present, skip standalone generate_model —
+                // run_code handles generation itself when commandTarget is null.
+                bool hasRunCodeCommand = false;
                 foreach (var c in result.commands)
                 {
                     if (c == null || string.IsNullOrWhiteSpace(c.action)) continue;
-
-                    string action = c.action.Trim().ToLowerInvariant();
-                    if (action != "run_code") continue;
-
-                    GameObject runTarget = commandTarget;
-                    if (runTarget == null && !string.IsNullOrWhiteSpace(c.target))
-                        runTarget = GameObject.Find(c.target);
-
-                    if (runTarget != null)
+                    if (c.action.Trim().ToLowerInvariant() == "run_code")
                     {
-                        hasRunnableCodeTarget = true;
+                        hasRunCodeCommand = true;
                         break;
                     }
                 }
@@ -685,20 +688,22 @@ public class VoiceCaptureAndSend : MonoBehaviour
                         ? ""
                         : c.action.Trim().ToLowerInvariant();
 
-                    if (hasRunnableCodeTarget && action == "generate_model")
+                    // Skip generate_model when run_code is present —
+                    // run_code will generate the object itself if needed.
+                    if (hasRunCodeCommand && action == "generate_model")
                     {
-                        Debug.Log("[VoiceCaptureAndSend] Skipping generate_model because run_code has a valid target.");
+                        Debug.Log("[VoiceCaptureAndSend] Skipping generate_model because run_code is present.");
                         continue;
                     }
 
-                    bool startedJob = ApplyCommand(c, commandTarget, commandWallAnchor, requestStartTime);
+                    bool startedJob = ApplyCommand(c, commandTarget, liveGazeTarget, commandWallAnchor, requestStartTime);
                     startedAnyAsyncJob |= startedJob;
                     executedAnything = true;
                 }
             }
             else if (result.command != null)
             {
-                startedAnyAsyncJob = ApplyCommand(result.command, commandTarget, commandWallAnchor, requestStartTime);
+                startedAnyAsyncJob = ApplyCommand(result.command, commandTarget, liveGazeTarget, commandWallAnchor, requestStartTime);
                 executedAnything = true;
             }
 
@@ -711,7 +716,6 @@ public class VoiceCaptureAndSend : MonoBehaviour
 
             if (stateStore != null) stateStore.RequestSave();
 
-            // VOICE job finishes once commands are dispatched
             FinishJob(voiceJobId, true, startedAnyAsyncJob ? "dispatched_async" : "done");
 
             if (_autoLockedThisRun && !startedAnyAsyncJob && gazeInteractor != null)
@@ -728,8 +732,7 @@ public class VoiceCaptureAndSend : MonoBehaviour
     // =========================
     // Command dispatch
     // =========================
-    // UPDATED: takes startTimeOverride so instant commands time from stop-recording
-    bool ApplyCommand(Command cmd, GameObject commandTarget, WallAnchor commandWallAnchor, float startTimeOverride)
+    bool ApplyCommand(Command cmd, GameObject commandTarget, GameObject liveGazeTarget, WallAnchor commandWallAnchor, float startTimeOverride)
     {
         if (cmd == null || string.IsNullOrEmpty(cmd.action)) return false;
         if (gazeInteractor == null)
@@ -749,9 +752,6 @@ public class VoiceCaptureAndSend : MonoBehaviour
 
         switch (action)
         {
-            // ── Instant commands: StartJob uses startTimeOverride (stop-recording time)
-            // and FinishJobNextFrame keeps them visible properly.
-
             case "set_color":
                 {
                     int jobId = StartJob("set_color", $"→{cmd.color}", commandTarget, startTimeOverride);
@@ -769,33 +769,33 @@ public class VoiceCaptureAndSend : MonoBehaviour
                     return false;
                 }
 
-            case "set_scale":
+            case "scale":
                 {
-                    bool hasUniform = cmd.uniform > 0f;
-                    bool hasAnyXYZ = (cmd.x > 0f || cmd.y > 0f || cmd.z > 0f);
-                    string scaleDesc = hasUniform ? $"uniform={F(cmd.uniform)}" : $"xyz=({F(cmd.x)},{F(cmd.y)},{F(cmd.z)})";
-                    int jobId = StartJob("set_scale", scaleDesc, commandTarget, startTimeOverride);
-
-                    if (hasUniform)
-                        gazeInteractor.SetScaleUniformOnGazed(Mathf.Clamp(cmd.uniform, 0.01f, 100f));
-                    else if (hasAnyXYZ)
+                    bool hasAxis = !string.IsNullOrWhiteSpace(cmd.axis);
+                    if (hasAxis)
                     {
-                        float sx = Mathf.Clamp(cmd.x > 0f ? cmd.x : 1f, 0.01f, 100f);
-                        float sy = Mathf.Clamp(cmd.y > 0f ? cmd.y : 1f, 0.01f, 100f);
-                        float sz = Mathf.Clamp(cmd.z > 0f ? cmd.z : 1f, 0.01f, 100f);
-                        gazeInteractor.SetScaleXYZOnGazed(sx, sy, sz);
+                        // Directional sub-case: axis + delta
+                        float delta = cmd.delta;
+                        string ax = cmd.axis.Trim().ToLowerInvariant();
+                        if (ax != "x" && ax != "y" && ax != "z")
+                        {
+                            Debug.LogWarning($"[VoiceCaptureAndSend] scale: unknown axis '{ax}', ignoring.");
+                            return false;
+                        }
+                        int jobId = StartJob("scale", $"axis={ax} Δ{F(delta)}", commandTarget, startTimeOverride);
+                        Debug.Log($"[VoiceCaptureAndSend] scale axis={ax} delta={delta} → ScaleAxisOnGazed({ax},{F(delta)})");
+                        gazeInteractor.ScaleAxisOnGazed(ax, delta);
+                        StartCoroutine(FinishJobNextFrame(jobId, true));
                     }
-                    bool scaleOk = hasUniform || hasAnyXYZ;
-                    StartCoroutine(FinishJobNextFrame(jobId, scaleOk, scaleOk ? "" : "no scale values"));
-                    return false;
-                }
-
-            case "scale_by":
-                {
-                    float f = NormalizeScaleFactor(cmd.factor);
-                    int jobId = StartJob("scale_by", $"×{F(f)}", commandTarget, startTimeOverride);
-                    if (f > 0f) gazeInteractor.ScaleGazedBy(f);
-                    StartCoroutine(FinishJobNextFrame(jobId, f > 0f, f <= 0f ? "invalid factor" : ""));
+                    else
+                    {
+                        // Uniform sub-case: factor only
+                        float f = NormalizeScaleFactor(cmd.factor);
+                        int jobId = StartJob("scale", $"×{F(f)}", commandTarget, startTimeOverride);
+                        Debug.Log($"[VoiceCaptureAndSend] scale uniform factor={f} → ScaleGazedBy({F(f)})");
+                        if (f > 0f) gazeInteractor.ScaleGazedBy(f);
+                        StartCoroutine(FinishJobNextFrame(jobId, f > 0f, f <= 0f ? "invalid factor" : ""));
+                    }
                     return false;
                 }
 
@@ -843,20 +843,12 @@ public class VoiceCaptureAndSend : MonoBehaviour
                     }
                     string wtMsg = string.IsNullOrWhiteSpace(cmd.text) ? "Hello World" : cmd.text;
                     float wtSize = (cmd.font_size > 0f) ? cmd.font_size : 5f;
-
-                    // If you ALSO want write_text to include voice round-trip time, keep startTimeOverride.
-                    // Otherwise, replace startTimeOverride with -1f.
                     int jobId = StartJob("write_text", $"\"{wtMsg}\"", commandTarget, startTimeOverride);
-
                     CreateTextOnWallAtAnchor(commandWallAnchor, wtMsg, wtSize);
                     if (stateStore != null) stateStore.RequestSave();
                     StartCoroutine(FinishJobNextFrame(jobId, true));
                     return false;
                 }
-
-            // ─────────────────────────────────────────────────────────────
-            // ASYNC PARTS BELOW: unchanged behaviour (poster/texture/model)
-            // ─────────────────────────────────────────────────────────────
 
             case "generate_model":
                 {
@@ -923,28 +915,37 @@ public class VoiceCaptureAndSend : MonoBehaviour
 
             case "run_code":
                 {
-                    GameObject runTarget = commandTarget;
+                    string behaviourPrompt = !string.IsNullOrWhiteSpace(cmd.behaviour_prompt) ? cmd.behaviour_prompt
+                                           : !string.IsNullOrWhiteSpace(cmd.prompt) ? cmd.prompt
+                                           : "make this object rotate slowly";
 
-                    if (runTarget == null && !string.IsNullOrWhiteSpace(cmd.target))
-                        runTarget = GameObject.Find(cmd.target);
-
-                    if (runTarget == null)
+                    // Use LIVE gaze only — never the remembered target.
+                    // If the user isn't actively looking at something, generate the object instead.
+                    if (liveGazeTarget != null)
                     {
-                        Debug.LogWarning("[VoiceCaptureAndSend] run_code: no target. Look at an object first.");
+                        if (AICodeCommandHandler.Instance == null)
+                        {
+                            Debug.LogError("[VoiceCaptureAndSend] AICodeCommandHandler is not in the scene.");
+                            return false;
+                        }
+                        Debug.Log($"[VoiceCaptureAndSend] run_code: attaching to live gaze target '{liveGazeTarget.name}'");
+                        AICodeCommandHandler.Instance.HandleCommand(behaviourPrompt, liveGazeTarget);
+                        return true;
+                    }
+
+                    // Not gazing at anything → generate the object first, then attach code
+                    if (modelSpawner == null)
+                    {
+                        Debug.LogError("[VoiceCaptureAndSend] run_code: no gaze target and no RuntimeModelSpawner to generate one.");
                         return false;
                     }
 
-                    string prompt = !string.IsNullOrWhiteSpace(cmd.behaviour_prompt) ? cmd.behaviour_prompt
-                                  : !string.IsNullOrWhiteSpace(cmd.prompt) ? cmd.prompt
-                                  : "make this object rotate slowly";
-
-                    if (AICodeCommandHandler.Instance == null)
-                    {
-                        Debug.LogError("[VoiceCaptureAndSend] AICodeCommandHandler is not in the scene.");
-                        return false;
-                    }
-
-                    AICodeCommandHandler.Instance.HandleCommand(prompt, runTarget);
+                    string genPrompt = !string.IsNullOrWhiteSpace(cmd.target) ? cmd.target : "simple object";
+                    string genName   = !string.IsNullOrWhiteSpace(cmd.target) ? cmd.target : "Generated_01";
+                    Debug.Log($"[VoiceCaptureAndSend] run_code: no live gaze → generating '{genName}' then attaching code.");
+                    int genJobId = StartJob("model+code", "GENERATING", null);
+                    Vector3 spawnPos = GetPlacementPosition();
+                    StartCoroutine(GenerateAndAttachCode_Job(genJobId, genPrompt, genName, spawnPos, behaviourPrompt));
                     return true;
                 }
 
@@ -952,6 +953,48 @@ public class VoiceCaptureAndSend : MonoBehaviour
                 Debug.LogWarning("[VoiceCaptureAndSend] Unknown action: " + cmd.action);
                 return false;
         }
+    }
+
+    // =========================
+    // Async: Generate model then attach code
+    // =========================
+    private IEnumerator GenerateAndAttachCode_Job(int jobId, string genPrompt, string genName, Vector3 pos, string behaviourPrompt)
+    {
+        if (modelSpawner == null) { FinishJob(jobId, false, "no modelSpawner"); yield break; }
+        if (AICodeCommandHandler.Instance == null) { FinishJob(jobId, false, "no AICodeCommandHandler"); yield break; }
+
+        UpdateJob(jobId, "GENERATING", 10);
+        modelSpawner.GenerateAndSpawn(genPrompt, genName, pos, "preview", "realistic");
+
+        // Poll every second until the spawned object appears in the scene
+        const float timeout = 120f;
+        float elapsed = 0f;
+        GameObject spawnedObj = null;
+
+        while (elapsed < timeout)
+        {
+            yield return new WaitForSeconds(1f);
+            elapsed += 1f;
+
+            spawnedObj = FindGameObjectCaseInsensitive(genName);
+            if (spawnedObj != null) break;
+
+            int pct = Mathf.Clamp(10 + Mathf.RoundToInt((elapsed / timeout) * 60f), 10, 70);
+            UpdateJob(jobId, $"WAITING ({elapsed:0}s)", pct);
+        }
+
+        if (spawnedObj == null)
+        {
+            FinishJob(jobId, false, $"'{genName}' never appeared after {timeout}s");
+            yield break;
+        }
+
+        UpdateJob(jobId, "ATTACHING_CODE", 80);
+        Debug.Log($"[VoiceCaptureAndSend] GenerateAndAttachCode: attaching code to '{spawnedObj.name}'");
+        AICodeCommandHandler.Instance.HandleCommand(behaviourPrompt, spawnedObj);
+
+        if (stateStore != null) stateStore.RequestSave();
+        FinishJob(jobId, true, $"generated '{genName}' + code attached");
     }
 
     // =========================

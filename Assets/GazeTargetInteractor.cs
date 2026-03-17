@@ -313,8 +313,25 @@ public class GazeTargetInteractor : MonoBehaviour
     public void ScaleGazedBy(float factor)
     {
         var t = TargetForActions;
-        if (t != null) t.ScaleBy(factor);
-        if (logStackActions) Debug.Log($"[GAZE] scale_by -> target={NameOrNull(t)} factor={factor}");
+        if (t == null) return;
+
+        var poster = t.GetComponent<PersistablePoster>();
+        if (poster != null)
+        {
+            poster.widthMeters  = Mathf.Max(0.01f, poster.widthMeters  * factor);
+            poster.heightMeters = Mathf.Max(0.01f, poster.heightMeters * factor);
+            var spawner = FindFirstObjectByType<PosterSpawner>();
+            if (spawner != null)
+                spawner.ApplyWorldSizeToPoster(t.transform, poster.widthMeters, poster.heightMeters);
+            else
+                t.transform.localScale *= factor;
+            if (logStackActions) Debug.Log($"[GAZE] scale_by poster -> target={NameOrNull(t)} ×{factor} → w={poster.widthMeters} h={poster.heightMeters}");
+        }
+        else
+        {
+            t.ScaleBy(factor);
+            if (logStackActions) Debug.Log($"[GAZE] scale_by -> target={NameOrNull(t)} factor={factor}");
+        }
     }
 
     public void MoveGazedToWorld(float x, float y, float z)
@@ -382,14 +399,72 @@ public class GazeTargetInteractor : MonoBehaviour
         var target = TargetForActions;
         if (target == null) return;
 
-        Vector3 s = target.transform.localScale;
-        switch (axis)
+        var poster = target.GetComponent<PersistablePoster>();
+        if (poster != null)
         {
-            case "x": s.x = Mathf.Max(0.01f, s.x + deltaMeters); break;
-            case "y": s.y = Mathf.Max(0.01f, s.y + deltaMeters); break;
-            case "z": s.z = Mathf.Max(0.01f, s.z + deltaMeters); break;
+            // Poster local axes depend on wall orientation (set via LookRotation(-normal, up)).
+            // We must map world-space axis intent → poster width or height.
+            //
+            // Strategy: project each world axis onto the poster's local X (width) and Y (height).
+            // Whichever world axis aligns most with poster local X → that axis letter = width.
+            // Whichever world axis aligns most with poster local Y → that axis letter = height.
+            //
+            // This works regardless of which wall the poster is on.
+            Transform pt = target.transform;
+            Vector3 posterRight = pt.right;   // local X → poster width direction in world
+            Vector3 posterUp    = pt.up;      // local Y → poster height direction in world
+
+            // Dominant world axis of posterRight (X=0, Y=1, Z=2)
+            int widthWorldAxis  = DominantAxis(posterRight);
+            // Dominant world axis of posterUp
+            int heightWorldAxis = DominantAxis(posterUp);
+
+            int requestedAxis = axis == "x" ? 0 : axis == "y" ? 1 : 2;
+
+            var spawner = FindFirstObjectByType<PosterSpawner>();
+            if (requestedAxis == heightWorldAxis)
+                poster.heightMeters = Mathf.Max(0.01f, poster.heightMeters + deltaMeters);
+            else // treat any non-height axis as width (x or z depending on wall)
+                poster.widthMeters  = Mathf.Max(0.01f, poster.widthMeters  + deltaMeters);
+
+            if (spawner != null)
+                spawner.ApplyWorldSizeToPoster(pt, poster.widthMeters, poster.heightMeters);
+            else
+            {
+                Vector3 s = pt.localScale;
+                s.x = poster.widthMeters;
+                s.y = poster.heightMeters;
+                pt.localScale = s;
+            }
+
+            if (logStackActions)
+                Debug.Log($"[GAZE] scale_axis poster -> target={NameOrNull(target)} axis={axis} " +
+                          $"widthAxis={widthWorldAxis} heightAxis={heightWorldAxis} " +
+                          $"delta={deltaMeters} → w={poster.widthMeters} h={poster.heightMeters}");
         }
-        target.transform.localScale = s;
+        else
+        {
+            // Regular scene object: localScale axes match world axes directly.
+            Vector3 s = target.transform.localScale;
+            switch (axis)
+            {
+                case "x": s.x = Mathf.Max(0.01f, s.x + deltaMeters); break;
+                case "y": s.y = Mathf.Max(0.01f, s.y + deltaMeters); break;
+                case "z": s.z = Mathf.Max(0.01f, s.z + deltaMeters); break;
+            }
+            target.transform.localScale = s;
+            if (logStackActions)
+                Debug.Log($"[GAZE] scale_axis -> target={NameOrNull(target)} axis={axis} delta={deltaMeters} → localScale={s}");
+        }
+    }
+
+    // Returns 0 for X, 1 for Y, 2 for Z — whichever component of v has the largest magnitude.
+    static int DominantAxis(Vector3 v)
+    {
+        float ax = Mathf.Abs(v.x), ay = Mathf.Abs(v.y), az = Mathf.Abs(v.z);
+        if (ax >= ay && ax >= az) return 0;
+        if (ay >= ax && ay >= az) return 1;
+        return 2;
     }
 
     AIControllable FindBestByAngle()

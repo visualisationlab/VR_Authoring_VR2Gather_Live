@@ -1,4 +1,4 @@
-﻿using UnityEngine;
+using UnityEngine;
 
 [DisallowMultipleComponent]
 public class PersistablePoster : MonoBehaviour
@@ -15,6 +15,17 @@ public class PersistablePoster : MonoBehaviour
     {
         if (string.IsNullOrEmpty(id))
             id = System.Guid.NewGuid().ToString("N");
+    }
+
+    /// <summary>
+    /// Call this after any scale or move operation so widthMeters/heightMeters
+    /// stay in sync with the actual world-space size of the quad.
+    /// Uses lossyScale so it works correctly regardless of parent scaling.
+    /// </summary>
+    public void SyncSizeFromTransform()
+    {
+        widthMeters  = Mathf.Max(0.01f, transform.lossyScale.x);
+        heightMeters = Mathf.Max(0.01f, transform.lossyScale.y);
     }
 
     [System.Serializable]

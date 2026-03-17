@@ -1,4 +1,4 @@
-﻿using UnityEngine;
+using UnityEngine;
 using UnityEngine.Networking;
 using System.Collections;
 using System.IO;
@@ -125,6 +125,13 @@ public class PosterSpawner : MonoBehaviour
         ai.targetRenderer = poster.GetComponent<Renderer>();
         ai.rb = null;
         ai.useRigidbodyWhenAvailable = false;
+
+        // 9) ✅ Save state NOW — localPngPath is populated and the poster is fully
+        //    set up. This replaces the early RequestSave() in VoiceCaptureAndSend
+        //    which fired before the PNG download coroutine finished, resulting in
+        //    an empty localPngPath being persisted and a blank image on reload.
+        var store = FindFirstObjectByType<SceneStateStore>();
+        if (store != null) store.RequestSave();
     }
 
     // -------------------------------------------------------------------------
