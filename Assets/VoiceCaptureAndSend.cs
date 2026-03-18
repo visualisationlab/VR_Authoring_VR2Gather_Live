@@ -618,8 +618,16 @@ public class VoiceCaptureAndSend : MonoBehaviour
     // =========================
     IEnumerator SendAudioToServer(byte[] wavData, GameObject commandTarget, GameObject liveGazeTarget, WallAnchor commandWallAnchor, int voiceJobId, float requestStartTime)
     {
+        // Resolve gaze target name → send to server so LLM knows what "it/this/that" refers to
+        string gazeTargetName = "none";
+        if (commandTarget != null)
+            gazeTargetName = commandTarget.name;
+        else if (liveGazeTarget != null)
+            gazeTargetName = liveGazeTarget.name;
+
         WWWForm form = new WWWForm();
         form.AddBinaryData("audio", wavData, "recording.wav", "audio/wav");
+        form.AddField("gaze_target", gazeTargetName);  // ← LLM uses this as "target" for all commands
 
         UpdateJob(voiceJobId, "SENDING", 10);
 

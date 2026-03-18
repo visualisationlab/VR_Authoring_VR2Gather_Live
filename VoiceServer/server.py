@@ -1,150 +1,247 @@
-from fastapi import FastAPI, File, UploadFile, BackgroundTasks
+# =========================
+# LLM-DRIVEN XR SERVER
+# No keywords — pure natural language → LLM → Unity commands
+# Includes: Meshy.ai 3D generation, OpenAI image/texture generation
+# =========================
+
+from fastapi import FastAPI, File, Form, UploadFile, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-import uvicorn
-import os
-from datetime import datetime
-from faster_whisper import WhisperModel
-import requests
-import json
-import re
-import time
 from typing import Optional, Dict, Any, List
 from PIL import Image, ImageDraw
-import base64
+import os, json, re, time, base64, io
+from datetime import datetime
+from faster_whisper import WhisperModel
 from openai import OpenAI
-import io
 from dotenv import load_dotenv
+import requests
 
 load_dotenv()
+
 app = FastAPI()
 
+# =========================
+# CONFIG
+# =========================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 print("OPENAI_API_KEY loaded:", bool(OPENAI_API_KEY))
 
-# ---- Paths (Unity persistentDataPath on Windows) ----
+# ⭐ MODEL CHOICE:
+# "o4-mini"   → Best for this task: fast, cheap, excellent structured JSON output  ← RECOMMENDED
+# "gpt-4o"    → Also great, very fast, slightly weaker at strict JSON formatting
+# "o3"        → Most powerful reasoning, but slower and more expensive
+LLM_MODEL = "o4-mini"
+
 BASE_PATH = os.path.join(
-    os.path.expanduser("~"),
-    "AppData", "LocalLow", "DefaultCompany", "VRTApp-TestLocal"
+    os.path.expanduser("~"), "AppData", "LocalLow", "DefaultCompany", "VRTApp-TestLocal"
 )
 os.makedirs(BASE_PATH, exist_ok=True)
 
 TRANSCRIPT_FILE = os.path.join(BASE_PATH, "unity_transcripts.txt")
-AUDIO_DIR = os.path.join(BASE_PATH, "recorded_audio")
-os.makedirs(AUDIO_DIR, exist_ok=True)
+TEMP_AUDIO_PATH = os.path.join(BASE_PATH, "temp.wav")
 
 MODEL_DIR = os.path.join(BASE_PATH, "GeneratedModels")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-app.mount("/files", StaticFiles(directory=MODEL_DIR), name="files")
-
 POSTER_DIR = os.path.join(BASE_PATH, "posters")
 os.makedirs(POSTER_DIR, exist_ok=True)
-
-app.mount("/posters", StaticFiles(directory=POSTER_DIR), name="posters")
 
 TEXTURE_DIR = os.path.join(BASE_PATH, "textures")
 os.makedirs(TEXTURE_DIR, exist_ok=True)
 
-app.mount("/textures", StaticFiles(directory=TEXTURE_DIR), name="textures")
+# Serve generated files to Unity over HTTP
+app.mount("/files",    StaticFiles(directory=MODEL_DIR),  name="files")
+app.mount("/posters",  StaticFiles(directory=POSTER_DIR), name="posters")
+app.mount("/textures", StaticFiles(directory=TEXTURE_DIR),name="textures")
 
-# ---- Meshy config ----
+# =========================
+# MESHY CONFIG
+# =========================
 MESHY_API_KEY = os.getenv("MESHY_API_KEY")
-print("MESHY_API_KEY loaded:", bool(MESHY_API_KEY), flush=True)
+print("MESHY_API_KEY loaded:", bool(MESHY_API_KEY))
 
-MESHY_BASE = "https://api.meshy.ai"
-MESHY_TEXT2_3D_CREATE = f"{MESHY_BASE}/openapi/v2/text-to-3d"
-MESHY_TEXT2_3D_GET = f"{MESHY_BASE}/openapi/v2/text-to-3d"
+MESHY_BASE             = "https://api.meshy.ai"
+MESHY_TEXT2_3D_CREATE  = f"{MESHY_BASE}/openapi/v2/text-to-3d"
+MESHY_TEXT2_3D_GET     = f"{MESHY_BASE}/openapi/v2/text-to-3d"
 
+# In-memory job tracker for background Meshy tasks
 jobs: Dict[str, Dict[str, Any]] = {}
 
-# ---- Load Whisper model once ----
-print("Loading Whisper model...", flush=True)
-model = WhisperModel("small", device="cpu", compute_type="int8")
-print("Whisper model loaded.", flush=True)
-
+# =========================
+# WHISPER
+# =========================
+print("Loading Whisper model...")
+whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
+print("Whisper model ready.")
 
 # =========================
-# STARTUP EVENTS
+# SYSTEM PROMPT
 # =========================
+SYSTEM_PROMPT = """
+You are an AI agent that controls a Unity XR/VR environment by interpreting natural speech commands.
 
-@app.on_event("startup")
-def warmup_ollama():
-    print("=" * 40, flush=True)
-    print("[startup] Preloading llama3.2 model...", flush=True)
-    print("=" * 40, flush=True)
-    try:
-        resp = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "llama3.2:latest",
-                "prompt": 'Convert to JSON commands: "change the color to red"\nReturn: {"commands":[{"action":"set_color","target":"cube","color":"red"}]}',
-                "stream": False,
-                "keep_alive": "60m"
-            },
-            timeout=60
-        )
-        print(f"[startup] Ollama warmup complete. Status: {resp.status_code}", flush=True)
-    except Exception as e:
-        print("[startup] Ollama warmup failed:", e, flush=True)
+Your ONLY job is to output a valid JSON object with a "commands" array. No explanations. No markdown. No extra text. Just raw JSON.
 
+=== AVAILABLE ACTIONS ===
 
-@app.on_event("startup")
-def _print_routes():
-    print("=== Registered routes ===", flush=True)
-    for r in app.routes:
-        methods = getattr(r, "methods", None)
-        print(f"{getattr(r, 'path', '')}  {methods}", flush=True)
-    print("=========================", flush=True)
+1. generate_model
+   - Creates a 3D object from a text description using Meshy.ai
+   - Required: "prompt" (string), "name" (string, PascalCase object name)
+   - Optional: "position" ({"x","y","z"}), "scale" ({"x","y","z"}), "stage" ("preview" or "refine"), "art_style" ("realistic" or "cartoon")
+   - Example: {"action":"generate_model","prompt":"wooden dining chair","name":"Chair_01","stage":"preview","art_style":"realistic"}
 
+2. create_poster
+   - Generates and displays a flat image/poster on a wall or surface using DALL-E
+   - Required: "image_prompt" (string)
+   - Optional: "width_m" (float, meters), "height_m" (float, meters), "position" ({"x","y","z"})
+   - Example: {"action":"create_poster","image_prompt":"sunset over mountains","width_m":1.5,"height_m":1.0}
+
+3. set_wall_texture
+   - Applies a generated seamless texture to a wall or surface using DALL-E
+   - Required: "texture_prompt" (string)
+   - Optional: "target" (string: "wall", "floor", "ceiling", or object name)
+   - Example: {"action":"set_wall_texture","texture_prompt":"rough stone bricks","target":"wall"}
+
+4. translate
+   - Moves an object by a relative offset in meters
+   - Required: "dx" (float), "dy" (float), "dz" (float)
+   - Optional: "target" (string, object name — omit to move last selected object)
+   - Example: {"action":"translate","target":"Chair_01","dx":2.0,"dy":0,"dz":0}
+   - Note: dz=left/right (left=positive dz, right=negative dz), dy=up/down, dx=forward/back (forward=negative dx, back=positive dx)
+
+5. scale
+   - Scales an object uniformly or per axis
+   - Required: "factor" (float) OR "sx","sy","sz" (float, per axis)
+   - Optional: "target" (string)
+   - Example: {"action":"scale","target":"Chair_01","factor":1.5}
+
+6. set_color
+   - Changes the material color of an object
+   - Required: "color" (string: color name or hex like "#FF0000")
+   - Optional: "target" (string)
+   - Example: {"action":"set_color","target":"Chair_01","color":"red"}
+
+7. rotate
+   - Rotates an object by degrees
+   - Required: "rx" (float), "ry" (float), "rz" (float) — degrees around each axis
+   - Optional: "target" (string)
+   - Example: {"action":"rotate","target":"Chair_01","rx":0,"ry":90,"rz":0}
+
+8. delete_object
+   - Removes an object from the scene
+   - Required: "target" (string, object name)
+   - Example: {"action":"delete_object","target":"Chair_01"}
+
+9. run_code
+    - Generates and attaches a C# script to implement ANY behaviour at runtime
+    - Use for: animations, physics, particles, custom interactions, effects, or ANYTHING not covered by other actions
+    - FALLBACK RULE: if no other action fits the user intent, ALWAYS use run_code — never invent action names
+    - Required: "behaviour_prompt" (string — describe in detail what the C# script should do, including values and timing)
+    - Optional: "target" (string — omit to apply to last selected object)
+    - Example: {"action":"run_code","target":"Ball_01","behaviour_prompt":"make the object bounce up and down with sine wave motion, height 0.5m, period 1 second"}
+
+10. set_lighting
+    - Changes scene lighting
+    - Required: "preset" (string: "day", "night", "sunset", "studio", "dramatic") OR "color" (hex), "intensity" (0.0–2.0)
+    - Example: {"action":"set_lighting","preset":"sunset"}
+
+11. duplicate_object
+   - Duplicates/copies an existing object and places the copy at an offset from the original
+   - Required: "target" (string, name of the object to copy), "new_name" (string, PascalCase name for the copy)
+   - Optional: "dx" (float), "dy" (float), "dz" (float) — offset in meters from the original (default 0,0,0)
+   - Use this whenever the user says: "copy", "duplicate", "clone", "make another one", "make a copy of"
+   - Offset guide: "on top of" → dy=1.0, "next to" → dx=1.0, "behind" → dz=-1.0, "in front of" → dz=1.0
+   - Example: {"action":"duplicate_object","target":"Cube_01","new_name":"Cube_02","dx":0,"dy":1.0,"dz":0}
+
+12. no_action
+    - Use when the intent is unclear, the request is conversational, or nothing should happen
+    - Example: {"action":"no_action","reason":"unclear intent"}
+
+=== OUTPUT FORMAT ===
+{
+  "commands": [
+    { "action": "...", ... },
+    { "action": "...", ... }
+  ]
+}
+
+=== GAZE TARGET ===
+The user is wearing an XR headset with eye tracking. The object they are currently looking at is provided as GAZE_TARGET.
+- If the user says "it", "this", "that", "the object", or refers to something without naming it — use GAZE_TARGET as the "target" value.
+- If GAZE_TARGET is "none" or empty, the user is not looking at any specific object.
+- NEVER guess or invent object names like "Cube_01" or "Chair_01" as target — always use GAZE_TARGET for the currently selected object.
+- If the action is global (lighting, create new object, textures) then "target" is not needed.
+
+=== RULES ===
+- Output ONLY raw JSON. No markdown. No backticks. No explanations.
+- You may return MULTIPLE commands in one response (e.g. generate then color).
+- If the user wants a simple shape (cube/sphere), prefer spawn_primitive over generate_model.
+- If the user says "it" or "that", they mean the last object mentioned or created.
+- When translating directions: "left"→ positive dz, "right"→ negative dz, "up"→ positive dy, "down"→ negative dy, "forward"→ negative dx, "back"→ positive dx. NEVER mix these up — left/right is always dz, forward/back is always dx.
+- If intent is ambiguous but partially clear, make a reasonable interpretation.
+- Only return no_action if the input is purely conversational (greetings, questions, gibberish) with zero XR intent.
+
+=== FALLBACK RULE (MOST IMPORTANT) ===
+If the user's intent is clear but NO existing action covers it, you MUST use run_code as a fallback.
+NEVER invent new action names. NEVER return no_action just because the action doesn't exist in the schema.
+run_code can do ANYTHING in Unity via generated C# — use it for: physics, animations, particles, custom behaviours, grouping, constraints, lighting effects, or ANY creative/interactive effect.
+When using run_code as a fallback, write a detailed "behaviour_prompt" describing exactly what the C# script should do so Unity can implement it correctly.
+
+=== EXAMPLES ===
+
+User: "create a red wooden chair"
+{"commands":[{"action":"generate_model","prompt":"wooden chair","name":"Chair_01","stage":"preview","art_style":"realistic"},{"action":"set_color","target":"Chair_01","color":"red"}]}
+
+User: "make a poster of a snowy mountain landscape"
+{"commands":[{"action":"create_poster","image_prompt":"snowy mountain landscape","width_m":1.5,"height_m":1.0}]}
+
+User: "apply brick texture to the wall"
+{"commands":[{"action":"set_wall_texture","texture_prompt":"old red brick wall","target":"wall"}]}
+
+User: "move it 2 meters to the right and 1 meter up"
+GAZE_TARGET: "Cube_03"
+{"commands":[{"action":"translate","target":"Cube_03","dx":0,"dy":1.0,"dz":-2.0,"coord_space":"world"}]}
+
+User: "make it twice as big"
+GAZE_TARGET: "Chair_02"
+{"commands":[{"action":"scale","target":"Chair_02","factor":2.0}]}
+
+User: "turn it blue"
+GAZE_TARGET: "Sphere_01"
+{"commands":[{"action":"set_color","target":"Sphere_01","color":"blue","coord_space":"world"}]}
+
+User: "make it bounce"
+GAZE_TARGET: "Ball_01"
+{"commands":[{"action":"run_code","target":"Ball_01","behaviour_prompt":"make the object bounce up and down continuously with a height of 0.5 meters and smooth easing"}]}
+
+User: "make it spin"
+GAZE_TARGET: "Cube_01"
+{"commands":[{"action":"run_code","target":"Cube_01","behaviour_prompt":"rotate the object around its Y axis continuously at 90 degrees per second"}]}
+
+User: "make a copy of this and put it on top"
+GAZE_TARGET: "Cube_01"
+{"commands":[{"action":"duplicate_object","target":"Cube_01","new_name":"Cube_02","dx":0,"dy":1.0,"dz":0}]}
+
+User: "delete this"
+GAZE_TARGET: "Table_02"
+{"commands":[{"action":"delete_object","target":"Table_02"}]}
+
+User: "rotate it 45 degrees to the left"
+GAZE_TARGET: "Chair_01"
+{"commands":[{"action":"rotate","target":"Chair_01","rx":0,"ry":-45,"rz":0}]}
+
+User: "make it follow me"
+GAZE_TARGET: "Lamp_01"
+{"commands":[{"action":"run_code","target":"Lamp_01","behaviour_prompt":"make the object smoothly follow the XR player/camera position, maintaining a distance of 1.5 meters in front and 0.5 meters below eye level, using Lerp for smooth movement"}]}
+
+User: "hello how are you"
+{"commands":[{"action":"no_action","reason":"conversational input, no XR action needed"}]}
+"""
 
 # =========================
-# IMAGE GENERATION HELPERS
-# =========================
-
-def _make_ai_poster(prompt: str, out_path: str, w: int, h: int):
-    result = client.images.generate(
-        model="gpt-image-1",
-        prompt=f"Poster artwork, high quality, no text unless requested. {prompt}",
-        size="1024x1024",
-    )
-    img_bytes = base64.b64decode(result.data[0].b64_json)
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    if (w, h) != (1024, 1024):
-        img = img.resize((w, h), Image.LANCZOS)
-    img.save(out_path, "PNG")
-
-
-def _make_ai_texture(prompt: str, out_path: str, size_px: int = 1024):
-    result = client.images.generate(
-        model="gpt-image-1",
-        prompt=f"Seamless tileable texture. Realistic. No perspective. Even lighting. No text. {prompt}",
-        size=f"{size_px}x{size_px}",
-    )
-    img_bytes = base64.b64decode(result.data[0].b64_json)
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    img.save(out_path, "PNG")
-
-
-def _make_placeholder_poster(prompt: str, out_path: str, w: int, h: int):
-    # Fallback placeholder — do not delete
-    img = Image.new("RGB", (w, h), (245, 245, 245))
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([8, 8, w - 8, h - 8], outline=(40, 40, 40), width=4)
-    text = (prompt or "Poster").strip()[:220]
-    max_chars = 38 if w >= h else 30
-    lines = [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
-    y = 40
-    for ln in lines[:12]:
-        draw.text((30, y), ln, fill=(20, 20, 20))
-        y += 28
-    img.save(out_path, "PNG")
-
-
-# =========================
-# UTILITY HELPERS
+# MESHY HELPERS
 # =========================
 
 def _safe_name(name: str) -> str:
@@ -152,258 +249,7 @@ def _safe_name(name: str) -> str:
     return safe if safe else "generated_model"
 
 
-def _slug_to_name(s: str) -> str:
-    s = re.sub(r"[^a-zA-Z0-9]+", " ", (s or "")).strip()
-    parts = [p.capitalize() for p in s.split() if p]
-    if not parts:
-        return "Generated_01"
-    base = "".join(parts[:3])
-    return f"{base}_01"
-
-
-def _infer_object_phrase(text: str) -> str:
-    t = (text or "").strip()
-    tl = t.lower()
-    known_phrases = [
-        "cricket ball", "volley ball", "volleyball", "soccer ball", "football",
-        "basketball", "tennis ball", "golf ball"
-    ]
-    for kp in known_phrases:
-        if kp in tl:
-            return kp
-    tl = re.sub(
-        r"\b(please|for me|can you|could you|would you|i want|i need|make|create|generate|build|add|spawn|a|an|the|model|object|3d)\b",
-        " ", tl,
-    )
-    tl = re.sub(r"\s+", " ", tl).strip()
-    return tl if tl else t
-
-
-def _looks_like_example_leak(prompt: str, name: str) -> bool:
-    p = (prompt or "").lower()
-    n = (name or "").lower()
-    return ("wooden chair" in p) or (n == "chair_01") or ("chair_01" in n)
-
-
-# =========================
-# MATERIAL INTENT HELPERS
-# =========================
-
-MATERIAL_ALIASES = {
-    "wooden": "wood",
-    "steel": "metal",
-    "iron": "metal",
-    "gold": "metal",
-    "silver": "metal",
-    "copper": "metal",
-    "bronze": "metal",
-}
-
-MATERIAL_KEYWORDS = {
-    "wood", "wooden",
-    "metal", "steel", "iron", "gold", "silver", "copper", "bronze",
-    "glass",
-    "marble", "stone", "concrete",
-    "plastic", "rubber",
-    "fabric", "cloth", "leather"
-}
-
-WRITE_TEXT_PHRASES = ["write", "type", "print", "put text", "add text"]
-MATERIAL_INTENT_PHRASES = ["turn it", "turn this", "turn that"]
-GENERATION_OBJECT_WORDS = [
-    "chair", "table", "sofa", "lamp", "ball", "cube", "box", "robot",
-    "house", "car", "tree", "bottle", "phone", "mug", "cup", "vase", "poster"
-]
-
-
-# =========================
-# FILLER / NOISE FILTER
-# =========================
-
-FILLER_WORDS = {
-    "yes", "no", "ok", "okay", "yeah", "yep", "nope", "sure", "right",
-    "hmm", "uh", "um", "ah", "oh", "eh", "huh", "hi", "hello",
-    "bye", "thanks", "thank", "you", "please", "sorry", "what",
-    "alright", "fine", "good", "great", "nice", "cool", "wow",
-}
-
-def _is_filler_transcript(text: str) -> bool:
-    """Return True if the transcript is just noise/filler and not a real command."""
-    cleaned = re.sub(r"[^a-z\s]", "", text.lower())
-    words = [w for w in cleaned.split() if w]
-    if not words:
-        return True
-    unique = set(words)
-    non_fillers = unique - FILLER_WORDS
-    # All words are filler words
-    if not non_fillers:
-        return True
-    # Single unique word repeated 3+ times (e.g. "yes yes yes yes")
-    if len(unique) == 1 and len(words) >= 3:
-        return True
-    # Two or fewer unique words, all filler (e.g. "yes yes ok ok")
-    if len(unique) <= 2 and not non_fillers:
-        return True
-    return False
-
-
-def _looks_like_write_text_request(text: str) -> bool:
-    if not text:
-        return False
-    tl = text.lower()
-    return ("wall" in tl) and any(p in tl for p in WRITE_TEXT_PHRASES)
-
-
-def _extract_write_text_payload(text: str) -> Dict[str, Any]:
-    t = (text or "").strip()
-    msg = ""
-    size = 60
-
-    m = re.search(r"['\"]([^'\"]+)['\"]", t)
-    if m:
-        msg = m.group(1).strip()
-    else:
-        for sep in [".", ":", "-", "\u2014"]:
-            if sep in t:
-                parts = [p.strip() for p in t.split(sep) if p.strip()]
-                if len(parts) >= 2:
-                    msg = parts[-1].strip()
-                    break
-        if not msg:
-            m2 = re.search(
-                r"\b(?:write|type|print|put text|add text)\b\s+(.*?)\s+\b(?:on|to)\b\s+(?:the\s+)?wall\b",
-                t, flags=re.IGNORECASE
-            )
-            if m2:
-                msg = m2.group(1).strip()
-        if not msg:
-            msg = re.sub(
-                r"^\s*(?:write|type|print|put text|add text)\s*(?:text\s*)?(?:on|to)\s*(?:this|the)?\s*wall\s*[:,\-\u2013\u2014]?\s*",
-                "", t, flags=re.IGNORECASE
-            ).strip()
-
-    msg = re.sub(r"\b(on|to)\b\s+(?:this|the\s+)?wall\b", "", msg, flags=re.IGNORECASE).strip()
-    msg = re.sub(r"\s+", " ", msg).strip()
-
-    ms = re.search(r"\b(?:font\s*size|size)\s*(\d{2,3})\b", t, flags=re.IGNORECASE)
-    if ms:
-        try:
-            size = int(ms.group(1))
-        except Exception:
-            size = 60
-    size = max(10, min(200, size))
-
-    if not msg:
-        msg = "Hello World"
-
-    return {"text": msg, "font_size": size}
-
-
-def _extract_material_keyword(text: str) -> Optional[str]:
-    if not text:
-        return None
-    tl = text.lower()
-    for m in MATERIAL_KEYWORDS:
-        if re.search(rf"\b{re.escape(m)}\b", tl):
-            return MATERIAL_ALIASES.get(m, m)
-    return None
-
-
-def _looks_like_material_overlay_request(text: str) -> Optional[str]:
-    if not text:
-        return None
-    tl = text.lower().strip()
-    mat = _extract_material_keyword(tl)
-    if not mat:
-        return None
-    has_material_intent_phrase = any(p in tl for p in MATERIAL_INTENT_PHRASES)
-    has_pronoun_target = any(w in tl.split() for w in ["it", "this", "that"])
-    mentions_object_noun = any(w in tl for w in GENERATION_OBJECT_WORDS)
-    if (has_material_intent_phrase or has_pronoun_target) and not mentions_object_noun:
-        return mat
-    if "set material" in tl or "change material" in tl or "set texture" in tl or "change texture" in tl:
-        return mat
-    return None
-
-
-# =========================
-# POSTER INTENT HELPERS
-# =========================
-
-POSTER_PHRASES = [
-    "image on the wall", "put an image", "put a picture", "hang a poster",
-    "generate a poster", "create a poster", "make a poster", "wall poster",
-    "put a poster", "add a poster", "place a poster"
-    # ← removed bare "poster" — too broad, matches "move this poster"
-]
-
-MOVEMENT_WORDS = ["move", "translate", "shift", "push", "pull", "slide", "up", "down", "left", "right", "forward", "back"]
-
-def _looks_like_poster_request(text: str) -> bool:
-    if not text:
-        return False
-    tl = text.lower()
-    # If it's a movement command, don't treat it as a poster creation request
-    if any(w in tl for w in MOVEMENT_WORDS):
-        return False
-    return any(p in tl for p in POSTER_PHRASES)
-
-def _extract_size_meters(text: str) -> Optional[Dict[str, float]]:
-    if not text:
-        return None
-    tl = text.lower().replace("meters", "m").replace("meter", "m")
-    m = re.search(r"(\d+(?:\.\d+)?)\s*m?\s*(?:x|by)\s*(\d+(?:\.\d+)?)\s*m", tl)
-    if not m:
-        m = re.search(r"(\d+(?:\.\d+)?)\s*(?:x|by)\s*(\d+(?:\.\d+)?)\s*m", tl)
-    if not m:
-        return None
-    try:
-        w = max(0.1, min(20.0, float(m.group(1))))
-        h = max(0.1, min(20.0, float(m.group(2))))
-        return {"width_m": w, "height_m": h}
-    except Exception:
-        return None
-
-
-# =========================
-# TEXTURE INTENT HELPERS
-# =========================
-
-TEXTURE_PHRASES = [
-    "texture", "wall texture", "pattern", "tileable", "seamless",
-    "make it look like", "cover the wall", "wallpaper"
-]
-
-
-def _looks_like_texture_request(text: str) -> bool:
-    if not text:
-        return False
-    tl = text.lower()
-    if any(p in tl for p in TEXTURE_PHRASES):
-        return True
-    if "wall" in tl and any(w in tl for w in ["bricks", "brick", "wood", "marble", "stone", "concrete", "flowers", "floral"]):
-        return True
-    return False
-
-
-def _extract_texture_prompt(text: str) -> str:
-    t = (text or "").strip()
-    t = re.sub(r"\b(generate|create|make|set|change|apply|put|add|give)\b", " ", t, flags=re.I)
-    t = re.sub(r"\b(a|an|the)\b", " ", t, flags=re.I)
-    t = re.sub(r"\b(texture|pattern|material|wallpaper)\b", " ", t, flags=re.I)
-    t = re.sub(r"\b(on|to|for)\b\s+(this|the)?\s*wall\b", " ", t, flags=re.I)
-    t = re.sub(r"\bmake\b\s+it\s+look\s+like\b", " ", t, flags=re.I)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t if t else "abstract pattern"
-
-
-# =========================
-# MESHY HELPERS
-# =========================
-
 def _meshy_headers() -> Dict[str, str]:
-    if not MESHY_API_KEY:
-        return {}
     return {
         "Authorization": f"Bearer {MESHY_API_KEY}",
         "Accept": "application/json",
@@ -463,13 +309,14 @@ def _generate_with_meshy_background(prompt: str, name: str, stage: str, art_styl
 
     try:
         if not MESHY_API_KEY:
-            raise RuntimeError("MESHY_API_KEY not set (use env var MESHY_API_KEY).")
+            raise RuntimeError("MESHY_API_KEY not set.")
 
         jobs[safe] = {
             "status": "RUNNING", "stage": stage, "task_id": None,
             "meshy_status": "PENDING", "progress": 0, "error": "",
         }
 
+        # --- Preview stage ---
         preview_task_id = _meshy_create_task(
             mode="preview",
             payload={"prompt": prompt, "art_style": art_style, "should_remesh": True},
@@ -494,14 +341,17 @@ def _generate_with_meshy_background(prompt: str, name: str, stage: str, art_styl
         if preview_task is None:
             raise RuntimeError("Timed out waiting for Meshy preview task.")
 
-        if (stage or "").lower() == "preview":
+        # If only preview requested, download and done
+        if (stage or "preview").lower() == "preview":
             glb_url = preview_task["model_urls"]["glb"]
             _download_to_file(glb_url, out_glb)
             jobs[safe]["status"] = "DONE"
             jobs[safe]["meshy_status"] = "SUCCEEDED"
             jobs[safe]["progress"] = 100
+            print(f"[meshy] preview done → {out_glb}", flush=True)
             return
 
+        # --- Refine stage ---
         refine_task_id = _meshy_create_task(
             mode="refine",
             payload={"preview_task_id": preview_task_id, "enable_pbr": True},
@@ -531,6 +381,7 @@ def _generate_with_meshy_background(prompt: str, name: str, stage: str, art_styl
         jobs[safe]["status"] = "DONE"
         jobs[safe]["meshy_status"] = "SUCCEEDED"
         jobs[safe]["progress"] = 100
+        print(f"[meshy] refine done → {out_glb}", flush=True)
 
     except Exception as e:
         print("[meshy] ERROR:", e, flush=True)
@@ -542,7 +393,50 @@ def _generate_with_meshy_background(prompt: str, name: str, stage: str, art_styl
 
 
 # =========================
-# Text-to-3D Endpoint
+# IMAGE GENERATION HELPERS
+# =========================
+
+def _make_ai_poster(prompt: str, out_path: str, w: int, h: int):
+    result = client.images.generate(
+        model="gpt-image-1",
+        prompt=f"Poster artwork, high quality, no text unless requested. {prompt}",
+        size="1024x1024",
+    )
+    img_bytes = base64.b64decode(result.data[0].b64_json)
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    if (w, h) != (1024, 1024):
+        img = img.resize((w, h), Image.LANCZOS)
+    img.save(out_path, "PNG")
+
+
+def _make_ai_texture(prompt: str, out_path: str, size_px: int = 1024):
+    result = client.images.generate(
+        model="gpt-image-1",
+        prompt=f"Seamless tileable texture. Realistic. No perspective. Even lighting. No text. {prompt}",
+        size=f"{size_px}x{size_px}",
+    )
+    img_bytes = base64.b64decode(result.data[0].b64_json)
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    img.save(out_path, "PNG")
+
+
+def _make_placeholder_poster(prompt: str, out_path: str, w: int, h: int):
+    """Fallback placeholder if image generation fails."""
+    img = Image.new("RGB", (w, h), (245, 245, 245))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([8, 8, w - 8, h - 8], outline=(40, 40, 40), width=4)
+    text = (prompt or "Poster").strip()[:220]
+    max_chars = 38 if w >= h else 30
+    lines = [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
+    y = 40
+    for ln in lines[:12]:
+        draw.text((30, y), ln, fill=(20, 20, 20))
+        y += 28
+    img.save(out_path, "PNG")
+
+
+# =========================
+# TEXT-TO-3D ENDPOINT
 # =========================
 
 class TextTo3DRequest(BaseModel):
@@ -564,6 +458,7 @@ def text_to_3d(req: TextTo3DRequest, background_tasks: BackgroundTasks):
             content={"status": "FAILED", "progress": 0, "message": "MESHY_API_KEY missing."},
         )
 
+    # Already generated — return immediately
     if os.path.exists(glb_path):
         return JSONResponse(status_code=200, content={
             "status": "SUCCEEDED", "progress": 100,
@@ -571,18 +466,22 @@ def text_to_3d(req: TextTo3DRequest, background_tasks: BackgroundTasks):
         })
 
     job = jobs.get(safe)
+
+    # Job still running
     if job and job.get("status") == "RUNNING":
         return JSONResponse(status_code=202, content={
             "status": job.get("meshy_status", "IN_PROGRESS"),
             "progress": int(job.get("progress", 0) or 0),
         })
 
+    # Previous job errored
     if job and job.get("status") == "ERROR":
         return JSONResponse(status_code=500, content={
             "status": "FAILED", "progress": 0,
             "message": job.get("error", "Unknown error"),
         })
 
+    # Start new background job
     stage = (req.stage or "preview").lower()
     art_style = (req.art_style or "realistic").lower()
     print(f"[text-to-3d] starting name={req.name} safe={safe} stage={stage} art_style={art_style}", flush=True)
@@ -597,7 +496,7 @@ def text_to_3d(req: TextTo3DRequest, background_tasks: BackgroundTasks):
 
 
 # =========================
-# Poster Image Endpoint
+# POSTER IMAGE ENDPOINT
 # =========================
 
 class PosterImageRequest(BaseModel):
@@ -616,11 +515,18 @@ def poster_image(req: PosterImageRequest):
     filename = f"poster_{ts}.png"
     out_path = os.path.join(POSTER_DIR, filename)
 
-    # _make_placeholder_poster(prompt, out_path, w, h)  # fallback, do not delete
-    _make_ai_poster(prompt, out_path, w, h)
+    try:
+        _make_ai_poster(prompt, out_path, w, h)
+    except Exception as e:
+        print(f"[poster] AI generation failed: {e}, using placeholder", flush=True)
+        _make_placeholder_poster(prompt, out_path, w, h)
 
     return JSONResponse(content={"image_url": f"http://localhost:8000/posters/{filename}"})
 
+
+# =========================
+# TEXTURE IMAGE ENDPOINT
+# =========================
 
 class TextureImageRequest(BaseModel):
     prompt: str
@@ -641,598 +547,145 @@ def texture_image(req: TextureImageRequest):
 
 
 # =========================
-# Voice -> Commands
+# LLM DECISION ENGINE
 # =========================
 
-def extract_commands(text: str) -> dict:
-
-    overall_start = time.time()
-
-    def _done(result: dict, label: str = "fast-path") -> dict:
-        elapsed = time.time() - overall_start
-        print(f"[extract] {label}: {elapsed:.3f}s", flush=True)
-        return result
-
-    def _extract_distance_meters(t: str, default: float = 0.2):
-        tl = t.lower().strip()
-
-        number_words = {
-            "zero": 0.0,
-            "a": 1.0,
-            "an": 1.0,
-            "one": 1.0,
-            "two": 2.0,
-            "three": 3.0,
-            "four": 4.0,
-            "five": 5.0,
-            "six": 6.0,
-            "seven": 7.0,
-            "eight": 8.0,
-            "nine": 9.0,
-            "ten": 10.0,
-            "half": 0.5,
-        }
-
-        cm_m = re.search(r"(\d+(?:\.\d+)?)\s*cm\b", tl)
-        if cm_m:
-            return float(cm_m.group(1)) * 0.01
-
-        m_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:meter|meters|metre|metres|m\b)", tl)
-        if m_m:
-            return float(m_m.group(1))
-
-        word_unit_m = re.search(
-            r"\b(zero|a|an|one|two|three|four|five|six|seven|eight|nine|ten|half)\b\s*"
-            r"(?:meter|meters|metre|metres|m\b|centimeter|centimeters|centimetre|centimetres|cm\b)?",
-            tl,
-        )
-        if word_unit_m:
-            word = word_unit_m.group(1)
-            value = number_words[word]
-            if re.search(rf"\b{re.escape(word)}\b\s*(?:centimeter|centimeters|centimetre|centimetres|cm\b)", tl):
-                return value * 0.01
-            return value
-
-        plain_m = re.search(r"(\d+(?:\.\d+)?)", tl)
-        if plain_m:
-            return float(plain_m.group(1))
-
-        return default
-
-    if not text or text.strip() == "":
-        return _done({"commands": [{"action": "no_action"}]}, "empty-input")
-
-    # ---- FILLER / NOISE FILTER ----
-    if _is_filler_transcript(text):
-        print(f"[extract] filler/noise transcript ignored: '{text}'", flush=True)
-        return _done({"commands": [{"action": "no_action"}]}, "filler-input")
-
-    # ---- FAST PATH: translate (reliable axis mapping, no LLM needed) ----
-    def _try_translate_fast_path(t: str):
-        tl = t.lower().strip()
-        move_words = ["move", "translate", "shift", "push", "pull", "slide"]
-        dir_words   = ["left", "right", "up", "down", "top", "bottom", "forward", "back", "backward", "front"]
-        if not any(w in tl for w in move_words + dir_words):
-            return None
-        # Must have at least one direction word to be confident
-        if not any(w in tl for w in dir_words):
-            return None
-
-        dist = _extract_distance_meters(tl, default=0.2)
-
-        dx = dy = dz = 0.0
-        # forward/back → dx  (forward=negative, backward=positive in this scene)
-        if re.search(r"\b(forward|front|ahead)\b", tl):                     dx = -dist
-        elif re.search(r"\b(back|backward|backwards|behind)\b", tl):        dx = dist
-        # up/down → dy
-        if re.search(r"\b(up|top|above|higher)\b", tl):                     dy = dist
-        elif re.search(r"\b(down|bottom|below|lower)\b", tl):               dy = -dist
-        # left/right → dz  (left=positive, right=negative)
-        if re.search(r"\bleft\b", tl):                                      dz = dist
-        elif re.search(r"\bright\b", tl):                                   dz = -dist
-
-        if dx == 0.0 and dy == 0.0 and dz == 0.0:
-            return None  # direction unclear — let LLM handle
-
-        return {"commands": [{"action": "translate", "target": "cube",
-                               "dx": dx, "dy": dy, "dz": dz}]}
-
-    translate_result = _try_translate_fast_path(text)
-    if translate_result:
-        return _done(translate_result, "translate-fast-path")
-
-    # ---- FAST PATH: scale ----
-    def _try_scale_fast_path(t: str):
-        tl = t.lower().strip()
-
-        grow_words   = ["increase", "enlarge", "expand", "bigger", "larger",
-                        "wider", "taller", "longer", "grow"]
-        shrink_words = ["decrease", "reduce", "shrink", "smaller", "shorter",
-                        "narrower", "thinner"]
-        scale_trigger_words = grow_words + shrink_words + ["scale"]
-
-        is_grow   = any(w in tl for w in grow_words)
-        is_shrink = any(w in tl for w in shrink_words)
-
-        # catch "scale up / scale down" via the word "scale" + direction hint
-        if "scale" in tl:
-            if re.search(r"\bscale\b.{0,30}\b(up|bigger|larger|taller|wider|longer|grow|more|out)\b", tl):
-                is_grow = True
-            elif re.search(r"\bscale\b.{0,30}\b(down|smaller|shorter|narrower|thinner|shrink|less|in)\b", tl):
-                is_shrink = True
-
-        # catch "make it bigger/smaller/taller/..." patterns
-        if re.search(r"\bmake\b.{0,20}\b(bigger|larger|taller|wider|longer)\b", tl):
-            is_grow = True
-        if re.search(r"\bmake\b.{0,20}\b(smaller|shorter|narrower|thinner)\b", tl):
-            is_shrink = True
-
-        if not (is_grow or is_shrink):
-            return None
-
-        # Extract numeric distance if present
-        dist = _extract_distance_meters(tl, default=None)
-
-        # Determine axis from directional/dimensional keywords
-        # X = forward/back/depth, Y = up/down/height/vertical, Z = left/right/width/horizontal
-        axis = None
-
-        # Explicit axis letters: "x direction", "x axis", "in x", "along x", etc.
-        if re.search(r"\b(in\s+)?x[\s-]*(direction|axis|dir)?\b", tl):
-            axis = "x"
-        elif re.search(r"\b(in\s+)?y[\s-]*(direction|axis|dir)?\b", tl):
-            axis = "y"
-        elif re.search(r"\b(in\s+)?z[\s-]*(direction|axis|dir)?\b", tl):
-            axis = "z"
-        # Dimensional / directional words
-        elif re.search(r"\bhorizontal\b", tl):
-            axis = "z"
-        elif re.search(r"\bvertical\b", tl):
-            axis = "y"
-        elif re.search(r"\b(width|wide|wider)\b", tl):
-            axis = "z"
-        elif re.search(r"\b(height|tall|taller)\b", tl):
-            axis = "y"
-        elif re.search(r"\b(depth|length|long|longer|forward|backward|back|front)\b", tl):
-            axis = "x"
-        elif re.search(r"\b(left|right)\b", tl):
-            axis = "z"
-        elif re.search(r"\b(up|down)\b", tl):
-            axis = "y"
-
-        sign = 1 if is_grow else -1
-
-        if axis is not None:
-            delta = sign * (dist if dist is not None else 0.2)
-            return {"commands": [{"action": "scale", "target": "cube",
-                                   "axis": axis, "delta": round(delta, 4)}]}
-        elif dist is not None:
-            # Distance given but no axis — fall through to LLM so it can infer intent
-            print(f"[scale-fast-path] dist={dist} given but no axis inferred — letting LLM handle", flush=True)
-            return None
-        else:
-            # No axis, no distance — uniform relative scale
-            is_a_bit = bool(re.search(r"\b(a bit|slightly|a little|little|somewhat)\b", tl))
-            factor = (1.2 if is_a_bit else 1.3) if is_grow else (0.8 if is_a_bit else 0.7)
-            return {"commands": [{"action": "scale", "target": "cube",
-                                   "factor": factor}]}
-
-    scale_result = _try_scale_fast_path(text)
-    if scale_result:
-        return _done(scale_result, "scale-fast-path")
-
-    if _looks_like_texture_request(text):
-        user_tex = _extract_texture_prompt(text)
-        return _done({"commands": [{
-            "action": "set_wall_texture",
-            "texture_prompt": f"seamless tileable texture of {user_tex}, realistic, no perspective, even lighting, no text",
-            "tile_scale": 1.8
-        }]}, "texture")
-
-    mat = _looks_like_material_overlay_request(text)
-    if mat:
-        return _done({"commands": [{"action": "set_material", "target": "cube", "material": mat}]}, "material")
-
-    if _looks_like_poster_request(text):
-        size = _extract_size_meters(text) or {"width_m": 1.0, "height_m": 1.0}
-        return _done({"commands": [{
-            "action": "create_poster",
-            "width_m": float(size["width_m"]),
-            "height_m": float(size["height_m"]),
-            "image_prompt": text
-        }]}, "poster")
-
-    if _looks_like_write_text_request(text):
-        payload = _extract_write_text_payload(text)
-        return _done({"commands": [{
-            "action": "write_text",
-            "text": payload["text"],
-            "font_size": payload["font_size"]
-        }]}, "write-text")
-
-    # ---- LLM PATH ----
-
-    desired_obj = _infer_object_phrase(text)
-    desired_name = _slug_to_name(desired_obj)
-
-    prompt = f"""
-You are an AI command generator for a Unity XR scene.
-
-Task:
-Convert the user's speech into ONE OR MORE JSON commands.
-Return ONLY valid JSON. No extra text.
-
-Output format (always):
-{{
-  "commands": [ ... ]
-}}
-
-Targets:
-- Use "cube" when user says cube/block/box. (Target is mostly ignored because Unity uses gaze.)
-
-Supported actions (you may output multiple in sequence):
-1) lock: {{"action":"lock"}}
-2) unlock: {{"action":"unlock"}}
-3) stack_on: {{"action":"stack_on"}}
-4) stack_on_next: {{"action":"stack_on_next"}}
-5) set_color: {{"action":"set_color","target":"cube","color":"red"}}
-6) set_material: {{"action":"set_material","target":"cube","material":"wood"}}
-
-7) translate (move relatively): {{"action":"translate","target":"cube","dx":0.0,"dy":0.2,"dz":0.0}}
-   - Applies to ANY gazed object, including posters, models, and cubes.
-   - AXIS RULES — always output all three fields (dx, dy, dz). Set unused axes to exactly 0.0.
-   - forward/back → dx ONLY.  forward=NEGATIVE dx, backward=POSITIVE dx.  dy=0.0, dz=0.0
-   - up/down      → dy ONLY.  up=positive dy,       down=negative dy.      dx=0.0, dz=0.0
-   - left/right   → dz ONLY.  left=positive dz,     right=negative dz.     dx=0.0, dy=0.0
-   - NEVER put a left/right value into dx. NEVER put a forward/back value into dz.
-   Examples (all axes always shown):
-   - "2 meters to the left"     -> dx=0.0,  dy=0.0,  dz=2.0
-   - "2 meters to the right"    -> dx=0.0,  dy=0.0,  dz=-2.0
-   - "1 meter forward"          -> dx=-1.0, dy=0.0,  dz=0.0
-   - "1 meter back"             -> dx=1.0,  dy=0.0,  dz=0.0
-   - "1 meter backwards"        -> dx=1.0,  dy=0.0,  dz=0.0
-   - "50cm up"                  -> dx=0.0,  dy=0.5,  dz=0.0
-   - "50cm down"                -> dx=0.0,  dy=-0.5, dz=0.0
-   - If no distance given ("move a bit left", "slightly up", "move left") -> use 0.2 as distance.
-   - POSTER MOVEMENT: "move the poster forward/back/left/right/up/down" -> translate
-
-8) scale (two sub-cases only):
-   {{"action":"scale","target":"cube","axis":"y","delta":1.0}}
-
-   Choose exactly ONE sub-case:
-
-   a) DIRECTIONAL (per-axis): user says "scale/stretch/extend/shrink/increase/decrease up/down/left/right/forward/back/horizontal/vertical"
-      Fields: axis + delta
-      axis mapping (X=forward/back, Y=up/down, Z=left/right/horizontal):
-        up / upward / vertical / height / tall   -> axis="y", positive delta = grow
-        down / downward                          -> axis="y", negative delta = shrink
-        left / right / horizontal / width / wide -> axis="z", positive delta = grow
-        forward / front / depth / length / long  -> axis="x", negative delta = grow (forward is -X)
-        backward / back                          -> axis="x", positive delta = grow
-      - "increase/enlarge/expand/bigger/wider/taller/longer" = grow (positive delta for y/z, negative for x-forward)
-      - "decrease/reduce/shrink/smaller/shorter/narrower"    = shrink (negative delta)
-      - If no distance given -> use 0.2 as delta.
-      Examples:
-        "scale up a bit"                          -> {{"action":"scale","target":"cube","axis":"y","delta":0.2}}
-        "scale 1 meter upward"                    -> {{"action":"scale","target":"cube","axis":"y","delta":1.0}}
-        "scale 50cm downward"                     -> {{"action":"scale","target":"cube","axis":"y","delta":-0.5}}
-        "extend 2 meters to the right"            -> {{"action":"scale","target":"cube","axis":"z","delta":2.0}}
-        "increase size horizontally by 10 meters" -> {{"action":"scale","target":"cube","axis":"z","delta":10.0}}
-        "increase the width by 2 meters"          -> {{"action":"scale","target":"cube","axis":"z","delta":2.0}}
-        "decrease the height by 1 meter"          -> {{"action":"scale","target":"cube","axis":"y","delta":-1.0}}
-        "make it taller by 3 meters"              -> {{"action":"scale","target":"cube","axis":"y","delta":3.0}}
-
-   b) RELATIVE UNIFORM: user says bigger/smaller/shrink/grow with NO specific direction
-      Fields: factor only (no axis)
-      factor < 1 = shrink, factor > 1 = grow
-      - If no factor amount is implied ("a bit bigger", "slightly smaller") -> use factor=1.2 for grow, 0.8 for shrink.
-      Examples:
-        "make it a bit bigger" -> {{"action":"scale","target":"cube","factor":1.2}}
-        "make it bigger"       -> {{"action":"scale","target":"cube","factor":1.3}}
-        "shrink it a bit"      -> {{"action":"scale","target":"cube","factor":0.8}}
-        "shrink it"            -> {{"action":"scale","target":"cube","factor":0.7}}
-
-11) place_on_floor: {{"action":"place_on_floor","target":"cube"}}
-
-12) generate_model:
-   Use the user's requested object in BOTH prompt and name.
-   Template:
-   {{"action":"generate_model","prompt":"<OBJECT_FROM_USER>","name":"<ObjectName_01>","stage":"preview","art_style":"realistic"}}
-
-13) create_poster:
-   Create an image poster and place it on the gazed wall surface.
-   Template:
-   {{"action":"create_poster","width_m":2.0,"height_m":3.0,"image_prompt":"a vintage travel poster of Amsterdam canals"}}
-   
-14) run_code:
-   If the user describes something they want an object TO DO
-   (rotate, spin, walk, bounce, follow, orbit, animate, patrol, etc.),
-   return:
-   {{"action":"run_code","behaviour_prompt":"<clear technical restatement of the behaviour>","target":"<object name if mentioned, else empty string>"}}
-
-Examples:
-"make the cube rotate slowly"
--> {{"commands":[{{"action":"run_code","behaviour_prompt":"Rotate the selected cube continuously around the Y axis at a slow speed.","target":"cube"}}]}}
-
-"make the human walk in a circle"
--> {{"commands":[{{"action":"run_code","behaviour_prompt":"Make the human walk continuously in a circle at a natural walking speed.","target":"human"}}]}}
-
-"make it bounce"
--> {{"commands":[{{"action":"run_code","behaviour_prompt":"Make the selected object bounce up and down continuously.","target":""}}]}}
-
-MODEL GENERATION RULES:
-- Ignore the phrases "start recording" and "stop recording" if they appear.
-- Use generate_model ONLY when the user asks to create a NEW object/model (e.g., "create a chair", "generate a table").
-- If the user says "make it wood/metal/glass/marble" or "set material/texture to X", that is NOT generate_model.
-  -> it must be set_material.
-
-MATERIAL RULES:
-- If user says: "make it wood/metal/glass/marble" or "set material to X" or "change texture to X"
-  -> output: {{"action":"set_material","material":"X"}}
-- Return only the material keyword (e.g., "wood", "metal", "glass", "marble").
-
-POSTER RULES:
-- If the user says: "create/generate/make a poster" or "put an image/picture on the wall"
-  -> output create_poster.
-- If user specifies size like "2m by 3m" or "1 by 1 meter", set width_m and height_m.
-- If user doesn't specify size, default width_m=1.0 height_m=1.0
-- The image_prompt should describe what the poster should show.
-- DO NOT use set_material for posters.
-- If the user says "move the poster forward/back/left/right/up/down", use translate (NOT create_poster).
-
-SCALING RULES (IMPORTANT):
-- All scaling uses action="scale". Pick exactly one sub-case:
-  a) Direction + number given ("1 meter upward/left/forward/etc.") -> use axis + delta fields
-  b) No direction, no specific number ("bigger", "smaller")        -> use factor field only
-- Never mix sub-cases (never include both axis and factor in the same command).
-
-Distinguish carefully:
-- One-time positional edits use translate.
-Examples:
-"make the cube rotate slowly"
--> {{"commands":[{{"action":"run_code","behaviour_prompt":"Rotate the selected cube continuously around the Y axis at a slow speed.","target":"cube"}}]}}
-
-"make the human walk in a circle"
--> {{"commands":[{{"action":"run_code","behaviour_prompt":"Make the human walk continuously in a circle at a natural walking speed.","target":"human"}}]}}
-
-"make it bounce"
--> {{"commands":[{{"action":"run_code","behaviour_prompt":"Make the selected object bounce up and down continuously.","target":""}}]}}
+def extract_json(text: str) -> dict:
+    """Robustly extracts JSON from LLM output."""
+    text = re.sub(r"```(?:json)?", "", text).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r'\{[\s\S]*\}', text)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+    return {"commands": [{"action": "no_action", "reason": "LLM returned unparseable output"}]}
 
 
-Rules:
-- If there is no clear actionable edit — including if the user says filler words like
-  "yes", "no", "ok", "yeah", "hmm", "uh", "thanks", or repeats a word —
-  return ONLY: {{"commands":[{{"action":"no_action"}}]}}
-- NEVER invent a command from ambiguous or non-command input.
-- Output ONLY the JSON object. No explanation, no markdown, no extra text.
+def llm_decide(transcript: str, gaze_target: str = "none") -> dict:
+    """Sends transcript + gaze context to the LLM and returns a parsed commands dict."""
+    if not transcript:
+        return {"commands": [{"action": "no_action", "reason": "empty transcript"}]}
 
-User: "{text}"
-"""
-
-    t_llm_start = time.time()
+    user_message = f'GAZE_TARGET: "{gaze_target}"\nUSER SAID: "{transcript}"'
 
     try:
-        resp = requests.post(
-            "http://localhost:11434/api/generate",
-            json={"model": "llama3.2:latest", "prompt": prompt, "stream": False, "keep_alive": "60m"},
-            timeout=30
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_message}
+            ],
+            max_completion_tokens=1000,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        raw = (data.get("response", "") or "").strip()
 
-        print(f"[extract] LLM request time: {time.time() - t_llm_start:.3f}s", flush=True)
+        raw = response.choices[0].message.content.strip()
 
-        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-        if not m:
-            return _done({"commands": [{"action": "no_action"}]}, "llm-no-json")
+        # Ask LLM to explain its decision in plain English
+        reasoning_response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a concise explainer. In 1-2 sentences, explain what action was chosen and why, based on the user's speech and gaze target. Be direct and plain — no JSON, no bullet points."},
+                {"role": "user", "content": f'User said: "{transcript}"\nGaze target: "{gaze_target}"\nDecided commands: {raw}'}
+            ],
+            max_completion_tokens=150,
+        )
+        reasoning = reasoning_response.choices[0].message.content.strip()
 
-        raw_json = m.group(0)
-
-        try:
-            obj = json.loads(raw_json)
-        except json.JSONDecodeError:
-            decoder = json.JSONDecoder()
-            obj, _ = decoder.raw_decode(raw_json)
-
-        if not isinstance(obj, dict) or "commands" not in obj or not isinstance(obj["commands"], list):
-            return _done({"commands": [{"action": "no_action"}]}, "llm-bad-schema")
-
-        normalized: List[Dict[str, Any]] = []
-        run_code_dispatched = False  # allow only one run_code per response
-        for c in obj["commands"]:
-            if not isinstance(c, dict):
-                continue
-
-            action = str(c.get("action", "")).strip().lower()
-            if not action:
-                continue
-
-            # --- run_code handler ---
-            if action == "run_code":
-                if run_code_dispatched:
-                    print("[extract] Skipping duplicate run_code command.", flush=True)
-                    continue
-                behaviour_prompt = str(
-                    c.get("behaviour_prompt", c.get("prompt", text)) or ""
-                ).strip()
-
-                target = str(c.get("target", "") or "").strip()
-
-                if not behaviour_prompt:
-                    c = {"action": "no_action"}
-                    action = "no_action"
-                else:
-                    c = {
-                        "action": "run_code",
-                        "behaviour_prompt": behaviour_prompt,
-                        "target": target
-                    }
-                    run_code_dispatched = True
-                    
-            if action in ("no_action", "noaction", "none"):
-                action = "no_action"
-
-            if action in ("set_color", "set_material", "move", "translate", "scale", "place_on_floor"):
-                c["target"] = str(c.get("target", "cube")).strip() or "cube"
-
-            if action == "set_material":
-                c["material"] = str(c.get("material", "")).strip()
-                c["material"] = re.sub(r"[\,\.\!\?]+$", "", c["material"]).strip().lower()
-                if c["material"] in MATERIAL_ALIASES:
-                    c["material"] = MATERIAL_ALIASES[c["material"]]
-                if not c["material"]:
-                    action = "no_action"
-
-            if action == "generate_model":
-                c["prompt"] = str(c.get("prompt", "")).strip()
-                c["name"] = str(c.get("name", "Generated_01")).strip() or "Generated_01"
-                c["stage"] = str(c.get("stage", "preview")).strip().lower() or "preview"
-                c["art_style"] = str(c.get("art_style", "realistic")).strip().lower() or "realistic"
-
-                p_low = (c.get("prompt") or "").strip().lower()
-                if p_low in MATERIAL_KEYWORDS or p_low in MATERIAL_ALIASES:
-                    mat2 = _looks_like_material_overlay_request(text)
-                    if mat2:
-                        normalized.append({"action": "set_material", "target": "cube", "material": mat2})
-                        continue
-
-                p = c["prompt"].lower()
-                if p in ("cube", "a cube", "generate a cube", "make a cube", "create a cube"):
-                    c["prompt"] = "simple cube"
-                    if c["name"].lower().startswith("generated"):
-                        c["name"] = "Cube_01"
-
-                if _looks_like_example_leak(c["prompt"], c["name"]):
-                    c["prompt"] = desired_obj
-                    c["name"] = desired_name
-                else:
-                    bad_prompt = (c["prompt"] or "").lower()
-                    tokens = [w for w in re.findall(r"[a-zA-Z]+", desired_obj.lower()) if len(w) > 2]
-                    if tokens and not any(tok in bad_prompt for tok in tokens):
-                        c["prompt"] = desired_obj
-                        c["name"] = desired_name
-
-                if not c["prompt"]:
-                    action = "no_action"
-
-            if action == "create_poster":
-                try:
-                    c["width_m"] = float(c.get("width_m", 1.0) or 1.0)
-                except Exception:
-                    c["width_m"] = 1.0
-                try:
-                    c["height_m"] = float(c.get("height_m", 1.0) or 1.0)
-                except Exception:
-                    c["height_m"] = 1.0
-                c["width_m"] = max(0.1, min(20.0, c["width_m"]))
-                c["height_m"] = max(0.1, min(20.0, c["height_m"]))
-                c["image_prompt"] = str(c.get("image_prompt", c.get("prompt", "")) or "").strip()
-                if not c["image_prompt"]:
-                    c["image_prompt"] = text
-                if "image_url" in c and c["image_url"] is not None:
-                    c["image_url"] = str(c["image_url"]).strip()
-
-            # Unified scale normalizer
-            if action == "scale":
-                axis = str(c.get("axis", "")).strip().lower()
-                axis_aliases = {
-                    "up": "y", "upward": "y", "down": "y", "downward": "y",
-                    "vertical": "y", "height": "y",
-                    "left": "z", "right": "z", "horizontal": "z", "width": "z",
-                    "forward": "x", "front": "x", "backward": "x", "back": "x",
-                    "depth": "x", "length": "x",
-                }
-                axis = axis_aliases.get(axis, axis)  # normalise word -> x/y/z
-
-                if axis in ("x", "y", "z"):
-                    # Sub-case a: directional
-                    try:
-                        delta = float(c.get("delta", 0.2))
-                    except Exception:
-                        delta = 0.2
-                    raw_axis_word = str(c.get("axis", "")).strip().lower()
-                    if raw_axis_word in ("down", "downward", "left", "backward", "back") and delta > 0:
-                        delta = -delta
-                    c = {"action": "scale", "target": c["target"], "axis": axis, "delta": delta}
-                    if delta == 0.0:
-                        action = "no_action"
-
-                else:
-                    # Sub-case b: relative uniform (factor only)
-                    try:
-                        factor = float(c.get("factor", 1.0))
-                    except Exception:
-                        factor = 1.0
-                    c = {"action": "scale", "target": c["target"], "factor": factor}
-                    if factor == 1.0:
-                        action = "no_action"
-
-                c["action"] = action
-
-            c["action"] = action
-            normalized.append(c)
-
-        if not normalized:
-            return _done({"commands": [{"action": "no_action"}]}, "llm-empty")
-
-        # SAFETY: never let old action names through if LLM ignores the prompt
-        normalized = [
-            c for c in normalized
-            if str(c.get("action", "")).strip().lower() not in ("set_scale", "scale_by", "scale_axis")
-        ]
-
-        return _done({"commands": normalized}, "llm")
+        return {**extract_json(raw), "_reasoning": reasoning}
 
     except Exception as e:
-        print("Error calling LLM for commands:", e, flush=True)
-        return _done({"commands": [{"action": "no_action"}]}, "llm-error")
+        print(f"[LLM error]: {e}")
+        return {"commands": [{"action": "no_action", "reason": f"LLM error: {str(e)}"}]}
 
 
 # =========================
-# Transcribe Endpoint
+# TRANSCRIBE ENDPOINT
 # =========================
 
 @app.post("/transcribe")
-async def transcribe(audio: UploadFile = File(...)):
-    temp_path = os.path.join(BASE_PATH, "temp_recording.wav")
-
-    with open(temp_path, "wb") as f:
+async def transcribe(
+    audio: UploadFile = File(...),
+    gaze_target: Optional[str] = Form(default="none"),
+):
+    # Save uploaded audio
+    with open(TEMP_AUDIO_PATH, "wb") as f:
         f.write(await audio.read())
 
-    print(f"[{datetime.now().isoformat(timespec='seconds')}] Transcribing {temp_path}...", flush=True)
+    gaze_target = gaze_target.strip() if gaze_target else "none"
+    print(f"[Gaze target]: '{gaze_target}'")
 
+    # Whisper transcription (translates any language → English)
     t0 = time.time()
-    segments, info = model.transcribe(temp_path, beam_size=5, task="translate")
-    print(f"whisper: {time.time() - t0:.3f} sec", flush=True)
+    segments, info = whisper_model.transcribe(TEMP_AUDIO_PATH, beam_size=5, task="translate")
+    transcript = "".join(s.text for s in segments).strip()
+    whisper_time = round(time.time() - t0, 3)
+    print(f"[Whisper] ({whisper_time}s): '{transcript}'")
 
-    text = "".join(segment.text for segment in segments).strip()
-    print("Detected language:", info.language, "prob:", info.language_probability, flush=True)
-
-    if not text:
-        text = "[No speech recognized]"
-
+    # LLM decision
     t1 = time.time()
-    result = extract_commands(text)
-    print(f"extract_commands: {time.time() - t1:.3f} sec", flush=True)
+    result = llm_decide(transcript, gaze_target=gaze_target)
+    llm_time = round(time.time() - t1, 3)
 
     commands = result.get("commands", [{"action": "no_action"}])
+    reasoning = result.get("_reasoning", "")
+    if not commands:
+        commands = [{"action": "no_action"}]
 
-    print("Transcript:", text, flush=True)
-    print("Commands:", commands, flush=True)
+    print("")
+    print(f"[LLM] ({llm_time}s) → {json.dumps(commands)}")
+    if reasoning:
+        print(f"[Reasoning] {reasoning}")
+    print("")
 
-    line = f"{datetime.now().isoformat(timespec='seconds')}: transcript={text} | commands={json.dumps(commands, ensure_ascii=False)}"
+    # Log to file
+    log_entry = {
+        "time": datetime.now().isoformat(),
+        "transcript": transcript,
+        "gaze_target": gaze_target,
+        "commands": commands,
+        "whisper_ms": int(whisper_time * 1000),
+        "llm_ms": int(llm_time * 1000),
+    }
     with open(TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+        f.write(json.dumps(log_entry) + "\n")
 
     return JSONResponse(content={
-        "transcript": text,
-        "detected_language": info.language,
-        "language_probability": info.language_probability,
+        "transcript": transcript,
+        "gaze_target": gaze_target,
         "commands": commands,
-        "command": commands[0] if commands else {"action": "no_action"}
+        "command": commands[0],
+        "meta": {
+            "whisper_ms": log_entry["whisper_ms"],
+            "llm_ms": log_entry["llm_ms"],
+            "model": LLM_MODEL,
+        }
     })
 
 
+# =========================
+# HEALTH CHECK
+# =========================
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "model": LLM_MODEL,
+        "whisper": "small",
+        "meshy": bool(MESHY_API_KEY),
+        "openai_images": bool(OPENAI_API_KEY),
+    }
+
+
+# =========================
+# RUN
+# =========================
+
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
