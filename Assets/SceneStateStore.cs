@@ -1,4 +1,5 @@
 using UnityEngine;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 
@@ -118,6 +119,11 @@ public class SceneStateStore : MonoBehaviour
                 // so the texture tiles correctly instead of stretching to (1,1).
                 if (texApplier != null && !string.IsNullOrEmpty(s.textureUrl))
                     texApplier.RestoreTexture(p);
+
+                // ✅ Reattach AI-generated behaviour code for pre-placed scene objects
+                // (runtime-spawned GLB objects are handled by RuntimeModelSpawner).
+                if (!string.IsNullOrEmpty(s.behaviourPrompt))
+                    StartCoroutine(ReattachCodeNextFrame(p.gameObject, s.behaviourPrompt));
             }
         }
 
@@ -142,6 +148,22 @@ public class SceneStateStore : MonoBehaviour
         }
 
         Debug.Log("[SceneStateStore] Loaded from: " + SavePath);
+    }
+
+    // ✅ Reattach AI-generated behaviour code one frame after load so the
+    // GameObject is fully initialised before AICodeCommandHandler runs.
+    IEnumerator ReattachCodeNextFrame(GameObject target, string behaviourPrompt)
+    {
+        yield return null;
+        if (AICodeCommandHandler.Instance != null)
+        {
+            Debug.Log($"[SceneStateStore] Reattaching behaviour to '{target.name}': {behaviourPrompt}");
+            AICodeCommandHandler.Instance.HandleCommand(behaviourPrompt, target);
+        }
+        else
+        {
+            Debug.LogWarning($"[SceneStateStore] AICodeCommandHandler not found — cannot reattach behaviour for '{target.name}'");
+        }
     }
 
     void SpawnPosterFromState(PersistablePoster.PosterState s, PosterSpawner spawner)

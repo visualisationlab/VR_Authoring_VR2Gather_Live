@@ -13,6 +13,8 @@ public class PersistableAIObject : MonoBehaviour
 
     public AIControllable controllable;
 
+    [Tooltip("AI-generated behaviour prompt (e.g. 'walk in a circle'). Persisted so the script is reattached on reload.")]
+    public string behaviourPrompt = "";
     void Awake()
     {
         if (controllable == null) controllable = GetComponent<AIControllable>();
@@ -65,7 +67,8 @@ public class PersistableAIObject : MonoBehaviour
             material = matName,
             textureUrl = textureUrl,
             localTexturePath = localTexturePath,
-            tileScale = tileScale
+            tileScale = tileScale,
+            behaviourPrompt = behaviourPrompt
         };
     }
 
@@ -85,6 +88,7 @@ public class PersistableAIObject : MonoBehaviour
         textureUrl = s.textureUrl;
         localTexturePath = s.localTexturePath;
         tileScale = (s.tileScale > 0f) ? s.tileScale : 1.8f;
+        behaviourPrompt = s.behaviourPrompt ?? "";
 
         // ✅ APPLY THE SAVED TEXTURE FROM DISK
         ApplySavedTextureIfAny();
@@ -171,5 +175,6 @@ public class PersistableAIObject : MonoBehaviour
 
         public bool hasMaterial;
         public string material;
+        public string behaviourPrompt;
     }
 }

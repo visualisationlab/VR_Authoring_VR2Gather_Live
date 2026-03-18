@@ -56,6 +56,8 @@ public class RuntimeModelSpawner : MonoBehaviour
         public Vector3 position;
         public Vector3 eulerRotation;
         public Vector3 scale = Vector3.one;
+        // ✅ Persisted behaviour prompt so AI-generated code is reattached on reload
+        public string behaviourPrompt = "";
     }
 
     [Serializable]
@@ -97,6 +99,25 @@ public class RuntimeModelSpawner : MonoBehaviour
     public void GenerateAndSpawn(string prompt, string assetName, Vector3 position, string stage = "preview", string artStyle = "realistic")
     {
         StartCoroutine(GenerateAndSpawnCo(prompt, assetName, position, stage, artStyle));
+    }
+
+    /// <summary>
+    /// Save a behaviour prompt onto an already-spawned model's registry record
+    /// so it is reattached automatically the next time the scene loads.
+    /// Called by VoiceCaptureAndSend after HandleCommand succeeds.
+    /// </summary>
+    public void SaveBehaviourPrompt(string assetName, string behaviourPrompt)
+    {
+        var reg = LoadRegistry();
+        var rec = reg.items.Find(x => x.name == assetName);
+        if (rec == null)
+        {
+            Debug.LogWarning($"[RuntimeModelSpawner] SaveBehaviourPrompt: no record found for '{assetName}'");
+            return;
+        }
+        rec.behaviourPrompt = behaviourPrompt ?? "";
+        File.WriteAllText(RegistryPath, JsonUtility.ToJson(reg, true));
+        Debug.Log($"[RuntimeModelSpawner] Saved behaviourPrompt for '{assetName}': {behaviourPrompt}");
     }
 
     IEnumerator GenerateAndSpawnCo(string prompt, string assetName, Vector3 position, string stage, string artStyle)
@@ -222,7 +243,8 @@ public class RuntimeModelSpawner : MonoBehaviour
                 localGlbPath = localPath,
                 position = spawnedGo.transform.position,
                 eulerRotation = spawnedGo.transform.eulerAngles,
-                scale = spawnedGo.transform.localScale
+                scale = spawnedGo.transform.localScale,
+                behaviourPrompt = "" // filled in later by SaveBehaviourPrompt()
             });
         }
     }
@@ -361,6 +383,8 @@ public class RuntimeModelSpawner : MonoBehaviour
 
             string promptToUse = string.IsNullOrEmpty(item.prompt) ? item.name : item.prompt;
 
+            GameObject respawnedGo = null;
+
             yield return LoadGlbIntoScene(
                 item.localGlbPath,
                 item.name,
@@ -369,8 +393,32 @@ public class RuntimeModelSpawner : MonoBehaviour
                 applyAutoPlacement: false,
                 forcedEulerRotation: item.eulerRotation,
                 forcedScale: item.scale,
-                onDone: null
+                onDone: go => { respawnedGo = go; }
             );
+
+            // ✅ Reattach AI-generated behaviour code if one was saved for this model.
+            // Wait one extra frame so the GameObject is fully initialised before
+            // AICodeCommandHandler tries to compile and attach the script.
+            if (respawnedGo != null && !string.IsNullOrEmpty(item.behaviourPrompt))
+            {
+                string capturedPrompt = item.behaviourPrompt;
+                GameObject capturedGo = respawnedGo;
+                StartCoroutine(ReattachCodeNextFrame(capturedGo, capturedPrompt));
+            }
+        }
+    }
+
+    IEnumerator ReattachCodeNextFrame(GameObject target, string behaviourPrompt)
+    {
+        yield return null; // one frame for full scene init
+        if (AICodeCommandHandler.Instance != null)
+        {
+            Debug.Log($"[RuntimeModelSpawner] Reattaching behaviour to '{target.name}': {behaviourPrompt}");
+            AICodeCommandHandler.Instance.HandleCommand(behaviourPrompt, target);
+        }
+        else
+        {
+            Debug.LogWarning($"[RuntimeModelSpawner] AICodeCommandHandler not found — cannot reattach behaviour for '{target.name}'");
         }
     }
 

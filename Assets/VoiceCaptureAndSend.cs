@@ -930,6 +930,10 @@ public class VoiceCaptureAndSend : MonoBehaviour
                         }
                         Debug.Log($"[VoiceCaptureAndSend] run_code: attaching to live gaze target '{liveGazeTarget.name}'");
                         AICodeCommandHandler.Instance.HandleCommand(behaviourPrompt, liveGazeTarget);
+                        // ✅ Persist the behaviour prompt so it is reattached on next load
+                        if (modelSpawner != null)
+                            modelSpawner.SaveBehaviourPrompt(liveGazeTarget.name, behaviourPrompt);
+                        if (stateStore != null) stateStore.RequestSave();
                         return true;
                     }
 
@@ -993,6 +997,8 @@ public class VoiceCaptureAndSend : MonoBehaviour
         Debug.Log($"[VoiceCaptureAndSend] GenerateAndAttachCode: attaching code to '{spawnedObj.name}'");
         AICodeCommandHandler.Instance.HandleCommand(behaviourPrompt, spawnedObj);
 
+        // ✅ Persist the behaviour prompt so it is reattached on next load
+        modelSpawner.SaveBehaviourPrompt(genName, behaviourPrompt);
         if (stateStore != null) stateStore.RequestSave();
         FinishJob(jobId, true, $"generated '{genName}' + code attached");
     }

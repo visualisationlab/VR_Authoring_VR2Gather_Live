@@ -653,6 +653,52 @@ def extract_commands(text: str) -> dict:
         print(f"[extract] {label}: {elapsed:.3f}s", flush=True)
         return result
 
+    def _extract_distance_meters(t: str, default: float = 0.2):
+        tl = t.lower().strip()
+
+        number_words = {
+            "zero": 0.0,
+            "a": 1.0,
+            "an": 1.0,
+            "one": 1.0,
+            "two": 2.0,
+            "three": 3.0,
+            "four": 4.0,
+            "five": 5.0,
+            "six": 6.0,
+            "seven": 7.0,
+            "eight": 8.0,
+            "nine": 9.0,
+            "ten": 10.0,
+            "half": 0.5,
+        }
+
+        cm_m = re.search(r"(\d+(?:\.\d+)?)\s*cm\b", tl)
+        if cm_m:
+            return float(cm_m.group(1)) * 0.01
+
+        m_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:meter|meters|metre|metres|m\b)", tl)
+        if m_m:
+            return float(m_m.group(1))
+
+        word_unit_m = re.search(
+            r"\b(zero|a|an|one|two|three|four|five|six|seven|eight|nine|ten|half)\b\s*"
+            r"(?:meter|meters|metre|metres|m\b|centimeter|centimeters|centimetre|centimetres|cm\b)?",
+            tl,
+        )
+        if word_unit_m:
+            word = word_unit_m.group(1)
+            value = number_words[word]
+            if re.search(rf"\b{re.escape(word)}\b\s*(?:centimeter|centimeters|centimetre|centimetres|cm\b)", tl):
+                return value * 0.01
+            return value
+
+        plain_m = re.search(r"(\d+(?:\.\d+)?)", tl)
+        if plain_m:
+            return float(plain_m.group(1))
+
+        return default
+
     if not text or text.strip() == "":
         return _done({"commands": [{"action": "no_action"}]}, "empty-input")
 
@@ -665,35 +711,25 @@ def extract_commands(text: str) -> dict:
     def _try_translate_fast_path(t: str):
         tl = t.lower().strip()
         move_words = ["move", "translate", "shift", "push", "pull", "slide"]
-        dir_words   = ["left", "right", "up", "down", "forward", "back", "backward", "front"]
+        dir_words   = ["left", "right", "up", "down", "top", "bottom", "forward", "back", "backward", "front"]
         if not any(w in tl for w in move_words + dir_words):
             return None
         # Must have at least one direction word to be confident
         if not any(w in tl for w in dir_words):
             return None
 
-        # Extract distance — check for cm first, then plain number
-        dist = 0.2  # default if no number given
-        cm_m = re.search(r"(\d+(?:\.\d+)?)\s*cm\b", tl)
-        m_m  = re.search(r"(\d+(?:\.\d+)?)\s*(?:meter|metre|m\b)", tl)
-        plain_m = re.search(r"(\d+(?:\.\d+)?)", tl)
-        if cm_m:
-            dist = float(cm_m.group(1)) * 0.01
-        elif m_m:
-            dist = float(m_m.group(1))
-        elif plain_m:
-            dist = float(plain_m.group(1))
+        dist = _extract_distance_meters(tl, default=0.2)
 
         dx = dy = dz = 0.0
-        # left/right → dx only
-        if re.search(r"\bright\b", tl):  dx = dist
-        elif re.search(r"\bleft\b", tl): dx = -dist
-        # up/down → dy only
-        if re.search(r"\bup\b", tl):     dy = dist
-        elif re.search(r"\bdown\b", tl): dy = -dist
-        # forward/back → dz only
-        if re.search(r"\b(forward|front)\b", tl):        dz = dist
-        elif re.search(r"\b(back|backward|behind)\b", tl): dz = -dist
+        # forward/back → dx  (forward=negative, backward=positive in this scene)
+        if re.search(r"\b(forward|front|ahead)\b", tl):                     dx = -dist
+        elif re.search(r"\b(back|backward|backwards|behind)\b", tl):        dx = dist
+        # up/down → dy
+        if re.search(r"\b(up|top|above|higher)\b", tl):                     dy = dist
+        elif re.search(r"\b(down|bottom|below|lower)\b", tl):               dy = -dist
+        # left/right → dz  (left=positive, right=negative)
+        if re.search(r"\bleft\b", tl):                                      dz = dist
+        elif re.search(r"\bright\b", tl):                                   dz = -dist
 
         if dx == 0.0 and dy == 0.0 and dz == 0.0:
             return None  # direction unclear — let LLM handle
@@ -705,7 +741,85 @@ def extract_commands(text: str) -> dict:
     if translate_result:
         return _done(translate_result, "translate-fast-path")
 
-    # ---- HARD OVERRIDES (no LLM needed) ----
+    # ---- FAST PATH: scale ----
+    def _try_scale_fast_path(t: str):
+        tl = t.lower().strip()
+
+        grow_words   = ["increase", "enlarge", "expand", "bigger", "larger",
+                        "wider", "taller", "longer", "grow"]
+        shrink_words = ["decrease", "reduce", "shrink", "smaller", "shorter",
+                        "narrower", "thinner"]
+        scale_trigger_words = grow_words + shrink_words + ["scale"]
+
+        is_grow   = any(w in tl for w in grow_words)
+        is_shrink = any(w in tl for w in shrink_words)
+
+        # catch "scale up / scale down" via the word "scale" + direction hint
+        if "scale" in tl:
+            if re.search(r"\bscale\b.{0,30}\b(up|bigger|larger|taller|wider|longer|grow|more|out)\b", tl):
+                is_grow = True
+            elif re.search(r"\bscale\b.{0,30}\b(down|smaller|shorter|narrower|thinner|shrink|less|in)\b", tl):
+                is_shrink = True
+
+        # catch "make it bigger/smaller/taller/..." patterns
+        if re.search(r"\bmake\b.{0,20}\b(bigger|larger|taller|wider|longer)\b", tl):
+            is_grow = True
+        if re.search(r"\bmake\b.{0,20}\b(smaller|shorter|narrower|thinner)\b", tl):
+            is_shrink = True
+
+        if not (is_grow or is_shrink):
+            return None
+
+        # Extract numeric distance if present
+        dist = _extract_distance_meters(tl, default=None)
+
+        # Determine axis from directional/dimensional keywords
+        # X = forward/back/depth, Y = up/down/height/vertical, Z = left/right/width/horizontal
+        axis = None
+
+        # Explicit axis letters: "x direction", "x axis", "in x", "along x", etc.
+        if re.search(r"\b(in\s+)?x[\s-]*(direction|axis|dir)?\b", tl):
+            axis = "x"
+        elif re.search(r"\b(in\s+)?y[\s-]*(direction|axis|dir)?\b", tl):
+            axis = "y"
+        elif re.search(r"\b(in\s+)?z[\s-]*(direction|axis|dir)?\b", tl):
+            axis = "z"
+        # Dimensional / directional words
+        elif re.search(r"\bhorizontal\b", tl):
+            axis = "z"
+        elif re.search(r"\bvertical\b", tl):
+            axis = "y"
+        elif re.search(r"\b(width|wide|wider)\b", tl):
+            axis = "z"
+        elif re.search(r"\b(height|tall|taller)\b", tl):
+            axis = "y"
+        elif re.search(r"\b(depth|length|long|longer|forward|backward|back|front)\b", tl):
+            axis = "x"
+        elif re.search(r"\b(left|right)\b", tl):
+            axis = "z"
+        elif re.search(r"\b(up|down)\b", tl):
+            axis = "y"
+
+        sign = 1 if is_grow else -1
+
+        if axis is not None:
+            delta = sign * (dist if dist is not None else 0.2)
+            return {"commands": [{"action": "scale", "target": "cube",
+                                   "axis": axis, "delta": round(delta, 4)}]}
+        elif dist is not None:
+            # Distance given but no axis — fall through to LLM so it can infer intent
+            print(f"[scale-fast-path] dist={dist} given but no axis inferred — letting LLM handle", flush=True)
+            return None
+        else:
+            # No axis, no distance — uniform relative scale
+            is_a_bit = bool(re.search(r"\b(a bit|slightly|a little|little|somewhat)\b", tl))
+            factor = (1.2 if is_a_bit else 1.3) if is_grow else (0.8 if is_a_bit else 0.7)
+            return {"commands": [{"action": "scale", "target": "cube",
+                                   "factor": factor}]}
+
+    scale_result = _try_scale_fast_path(text)
+    if scale_result:
+        return _done(scale_result, "scale-fast-path")
 
     if _looks_like_texture_request(text):
         user_tex = _extract_texture_prompt(text)
@@ -767,17 +881,18 @@ Supported actions (you may output multiple in sequence):
 7) translate (move relatively): {{"action":"translate","target":"cube","dx":0.0,"dy":0.2,"dz":0.0}}
    - Applies to ANY gazed object, including posters, models, and cubes.
    - AXIS RULES — always output all three fields (dx, dy, dz). Set unused axes to exactly 0.0.
-   - left/right  → dx ONLY.  right=positive dx, left=negative dx.  dy=0.0, dz=0.0
-   - up/down     → dy ONLY.  up=positive dy,    down=negative dy.  dx=0.0, dz=0.0
-   - forward/back→ dz ONLY.  forward=positive dz, back=negative dz. dx=0.0, dy=0.0
-   - NEVER put a left/right value into dz. NEVER put a forward/back value into dx.
+   - forward/back → dx ONLY.  forward=NEGATIVE dx, backward=POSITIVE dx.  dy=0.0, dz=0.0
+   - up/down      → dy ONLY.  up=positive dy,       down=negative dy.      dx=0.0, dz=0.0
+   - left/right   → dz ONLY.  left=positive dz,     right=negative dz.     dx=0.0, dy=0.0
+   - NEVER put a left/right value into dx. NEVER put a forward/back value into dz.
    Examples (all axes always shown):
-   - "2 meters to the right" -> dx=2.0,  dy=0.0, dz=0.0
-   - "1 meter left"          -> dx=-1.0, dy=0.0, dz=0.0
-   - "1 meter forward"       -> dx=0.0,  dy=0.0, dz=1.0
-   - "1 meter back"          -> dx=0.0,  dy=0.0, dz=-1.0
-   - "50cm up"               -> dx=0.0,  dy=0.5, dz=0.0
-   - "50cm down"             -> dx=0.0,  dy=-0.5, dz=0.0
+   - "2 meters to the left"     -> dx=0.0,  dy=0.0,  dz=2.0
+   - "2 meters to the right"    -> dx=0.0,  dy=0.0,  dz=-2.0
+   - "1 meter forward"          -> dx=-1.0, dy=0.0,  dz=0.0
+   - "1 meter back"             -> dx=1.0,  dy=0.0,  dz=0.0
+   - "1 meter backwards"        -> dx=1.0,  dy=0.0,  dz=0.0
+   - "50cm up"                  -> dx=0.0,  dy=0.5,  dz=0.0
+   - "50cm down"                -> dx=0.0,  dy=-0.5, dz=0.0
    - If no distance given ("move a bit left", "slightly up", "move left") -> use 0.2 as distance.
    - POSTER MOVEMENT: "move the poster forward/back/left/right/up/down" -> translate
 
@@ -786,22 +901,26 @@ Supported actions (you may output multiple in sequence):
 
    Choose exactly ONE sub-case:
 
-   a) DIRECTIONAL (per-axis): user says "scale/stretch/extend/shrink up/down/left/right/forward/back"
+   a) DIRECTIONAL (per-axis): user says "scale/stretch/extend/shrink/increase/decrease up/down/left/right/forward/back/horizontal/vertical"
       Fields: axis + delta
-      axis mapping:
-        up / upward              -> axis="y", delta=+X
-        down / downward          -> axis="y", delta=-X
-        left                     -> axis="x", delta=-X
-        right                    -> axis="x", delta=+X
-        forward / front          -> axis="z", delta=+X
-        backward / back          -> axis="z", delta=-X
-      - If no distance is given ("scale up a bit", "stretch it left", just "scale upward") -> use 0.2 as delta.
+      axis mapping (X=forward/back, Y=up/down, Z=left/right/horizontal):
+        up / upward / vertical / height / tall   -> axis="y", positive delta = grow
+        down / downward                          -> axis="y", negative delta = shrink
+        left / right / horizontal / width / wide -> axis="z", positive delta = grow
+        forward / front / depth / length / long  -> axis="x", negative delta = grow (forward is -X)
+        backward / back                          -> axis="x", positive delta = grow
+      - "increase/enlarge/expand/bigger/wider/taller/longer" = grow (positive delta for y/z, negative for x-forward)
+      - "decrease/reduce/shrink/smaller/shorter/narrower"    = shrink (negative delta)
+      - If no distance given -> use 0.2 as delta.
       Examples:
-        "scale up a bit"               -> {{"action":"scale","target":"cube","axis":"y","delta":0.2}}
-        "scale 1 meter upward"         -> {{"action":"scale","target":"cube","axis":"y","delta":1.0}}
-        "scale 50cm downward"          -> {{"action":"scale","target":"cube","axis":"y","delta":-0.5}}
-        "extend 2 meters to the right" -> {{"action":"scale","target":"cube","axis":"x","delta":2.0}}
-        "shrink 1 meter forward"       -> {{"action":"scale","target":"cube","axis":"z","delta":1.0}}
+        "scale up a bit"                          -> {{"action":"scale","target":"cube","axis":"y","delta":0.2}}
+        "scale 1 meter upward"                    -> {{"action":"scale","target":"cube","axis":"y","delta":1.0}}
+        "scale 50cm downward"                     -> {{"action":"scale","target":"cube","axis":"y","delta":-0.5}}
+        "extend 2 meters to the right"            -> {{"action":"scale","target":"cube","axis":"z","delta":2.0}}
+        "increase size horizontally by 10 meters" -> {{"action":"scale","target":"cube","axis":"z","delta":10.0}}
+        "increase the width by 2 meters"          -> {{"action":"scale","target":"cube","axis":"z","delta":2.0}}
+        "decrease the height by 1 meter"          -> {{"action":"scale","target":"cube","axis":"y","delta":-1.0}}
+        "make it taller by 3 meters"              -> {{"action":"scale","target":"cube","axis":"y","delta":3.0}}
 
    b) RELATIVE UNIFORM: user says bigger/smaller/shrink/grow with NO specific direction
       Fields: factor only (no axis)
@@ -1019,17 +1138,19 @@ User: "{text}"
                 axis = str(c.get("axis", "")).strip().lower()
                 axis_aliases = {
                     "up": "y", "upward": "y", "down": "y", "downward": "y",
-                    "left": "x", "right": "x",
-                    "forward": "z", "front": "z", "backward": "z", "back": "z",
+                    "vertical": "y", "height": "y",
+                    "left": "z", "right": "z", "horizontal": "z", "width": "z",
+                    "forward": "x", "front": "x", "backward": "x", "back": "x",
+                    "depth": "x", "length": "x",
                 }
                 axis = axis_aliases.get(axis, axis)  # normalise word -> x/y/z
 
                 if axis in ("x", "y", "z"):
                     # Sub-case a: directional
                     try:
-                        delta = float(c.get("delta", 0.0))
+                        delta = float(c.get("delta", 0.2))
                     except Exception:
-                        delta = 0.0
+                        delta = 0.2
                     raw_axis_word = str(c.get("axis", "")).strip().lower()
                     if raw_axis_word in ("down", "downward", "left", "backward", "back") and delta > 0:
                         delta = -delta
