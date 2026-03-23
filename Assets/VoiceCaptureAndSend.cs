@@ -39,8 +39,12 @@ public class VoiceCaptureAndSend : MonoBehaviour
     public SceneStateStore stateStore;
 
     [Header("Server")]
-    public string serverUrl = "http://localhost:8000/transcribe";
-    public string textTo3dUrl = "http://localhost:8000/api/text-to-3d";
+    public string serverUrl         = "http://localhost:8000/transcribe";
+    public string textTo3dUrl       = "http://localhost:8000/api/text-to-3d";
+
+    [Header("Confirmation Dialog")]
+    [Tooltip("Drag the LLM_Output_Confirmation_Commanc GameObject here")]
+    public ConfirmationDialog confirmationDialog;
 
     [Header("Gaze Target")]
     public GazeTargetInteractor gazeInteractor;
@@ -52,7 +56,9 @@ public class VoiceCaptureAndSend : MonoBehaviour
 
     [Header("Keyboard Controls")]
     public KeyCode startKey = KeyCode.R;
-    public KeyCode stopKey = KeyCode.T;
+    public KeyCode stopKey  = KeyCode.T;
+
+
 
     [Header("Movement & Scale Interpretation")]
     public bool translateInCameraSpace = false;
@@ -310,14 +316,6 @@ public class VoiceCaptureAndSend : MonoBehaviour
     }
 
     [System.Serializable]
-    public class AgentResult
-    {
-        public string transcript;
-        public Command command;
-        public Command[] commands;
-    }
-
-    [System.Serializable]
     private class TextTo3DRequest
     {
         public string prompt;
@@ -395,8 +393,9 @@ public class VoiceCaptureAndSend : MonoBehaviour
 
     void Update()
     {
-        if (Input.GetKeyDown(startKey)) StartRecording();
-        if (Input.GetKeyDown(stopKey)) StopRecordingAndSend();
+        // R = start listening, T = stop listening entirely
+        if (Input.GetKeyDown(startKey)) StartListening();
+        if (Input.GetKeyDown(stopKey))  StopListening();
 
         if (rightController.isValid)
         {
@@ -405,8 +404,9 @@ public class VoiceCaptureAndSend : MonoBehaviour
             {
                 if (aPressed && !lastAPressed)
                 {
-                    if (!isRecording) StartRecording();
-                    else StopRecordingAndSend();
+                    // Single button toggles the whole listening session
+                    if (!isRecording) StartListening();
+                    else              StopListening();
                 }
                 lastAPressed = aPressed;
             }
@@ -561,16 +561,17 @@ public class VoiceCaptureAndSend : MonoBehaviour
     }
 
     // =========================
-    // Recording
+    // Recording — simple press-to-start / press-to-stop
     // =========================
+
     public void StartRecording()
     {
         if (isRecording) { SetHeaderLine("⚠ Already recording..."); return; }
         if (string.IsNullOrEmpty(microphoneDevice)) { SetHeaderLine("❌ No microphone selected."); return; }
 
-        recordedClip = Microphone.Start(microphoneDevice, true, maxRecordLengthSeconds, sampleRate);
-        isRecording = true;
-        SetHeaderLine("🎙 Recording...");
+        recordedClip = Microphone.Start(microphoneDevice, false, maxRecordLengthSeconds, sampleRate);
+        isRecording  = true;
+        SetHeaderLine("🎙 Recording... (press again to stop)");
     }
 
     public void StopRecordingAndSend()
@@ -581,41 +582,69 @@ public class VoiceCaptureAndSend : MonoBehaviour
         Microphone.End(microphoneDevice);
         isRecording = false;
 
-        // Live gaze only (no remembered fallback) — used exclusively by run_code
-        // so it never accidentally attaches to a previously-looked-at object.
-        TryGetCurrentTargetObject(out GameObject liveGazeTarget);
+        if (position <= 0 || recordedClip == null) { SetHeaderLine("⚠ No audio captured."); return; }
 
-        // Full resolve (live + remembered) — used by all other commands
+        // Trim the clip to what was actually recorded
+        int channels = recordedClip.channels;
+        float[] samples = new float[position * channels];
+        recordedClip.GetData(samples, 0);
+        AudioClip trimmed = AudioClip.Create("Recording", position, channels, sampleRate, false);
+        trimmed.SetData(samples, 0);
+        byte[] wavData = AudioClipToWav(trimmed);
+
+        // Snapshot gaze context
+        TryGetCurrentTargetObject(out GameObject liveGazeTarget);
         GameObject commandTarget = ResolveCommandTarget();
         if (commandTarget != null) RememberTarget(commandTarget);
 
         RaycastHit capturedHit = default;
-        bool hasCommandHit = gazeInteractor != null && gazeInteractor.TryGetCurrentHit(out capturedHit);
-        WallAnchor commandWallAnchor = hasCommandHit ? WallAnchor.FromHit(capturedHit) : default;
-
+        bool hasHit = gazeInteractor != null && gazeInteractor.TryGetCurrentHit(out capturedHit);
+        WallAnchor commandWallAnchor = hasHit ? WallAnchor.FromHit(capturedHit) : default;
         _autoLockedThisRun = false;
 
-        if (position <= 0 || recordedClip == null) { SetHeaderLine("⚠ No audio captured."); return; }
-
-        int channels = recordedClip.channels;
-        float[] samples = new float[position * channels];
-        recordedClip.GetData(samples, 0);
-
-        AudioClip trimmedClip = AudioClip.Create("TrimmedRecording", position, channels, recordedClip.frequency, false);
-        trimmedClip.SetData(samples, 0);
-
-        byte[] wavData = AudioClipToWav(trimmedClip);
+        string gazeTargetName = commandTarget  != null ? commandTarget.name
+                              : liveGazeTarget != null ? liveGazeTarget.name
+                              : "none";
 
         float requestStartTime = Time.realtimeSinceStartup;
         int voiceJobId = StartJob("voice", "UPLOADING", commandTarget, requestStartTime);
 
-        SetHeaderLine("⏹ Processing...");
-        StartCoroutine(SendAudioToServer(wavData, commandTarget, liveGazeTarget, commandWallAnchor, voiceJobId, requestStartTime));
+        SetHeaderLine("⏳ Processing...");
+        StartCoroutine(SendAudioToServer(wavData, commandTarget, liveGazeTarget,
+                                         commandWallAnchor, voiceJobId, requestStartTime));
     }
+
+    // Aliases so the XR button wiring (StartListening / StopListening) still compiles
+    public void StartListening()  => StartRecording();
+    public void StopListening()   => StopRecordingAndSend();
 
     // =========================
     // Server
     // =========================
+
+    // ── JSON models ───────────────────────────────────────────────────────
+    [System.Serializable]
+    private class TranscribeGateResponse
+    {
+        public string transcript;
+        public bool   requires_confirmation;
+        public string session_id;
+        public string confirmation_message;
+        // populated only when requires_confirmation == false:
+        public Command   command;
+        public Command[] commands;
+    }
+
+    [System.Serializable]
+    private class ExecuteResponse
+    {
+        public string   transcript;
+        public string   gaze_target;
+        public Command  command;
+        public Command[] commands;
+    }
+
+    // ── /transcribe — Whisper + LLM + confirmation gate ────────────────
     IEnumerator SendAudioToServer(byte[] wavData, GameObject commandTarget, GameObject liveGazeTarget, WallAnchor commandWallAnchor, int voiceJobId, float requestStartTime)
     {
         // Resolve gaze target name → send to server so LLM knows what "it/this/that" refers to
@@ -627,7 +656,7 @@ public class VoiceCaptureAndSend : MonoBehaviour
 
         WWWForm form = new WWWForm();
         form.AddBinaryData("audio", wavData, "recording.wav", "audio/wav");
-        form.AddField("gaze_target", gazeTargetName);  // ← LLM uses this as "target" for all commands
+        form.AddField("gaze_target", gazeTargetName);
 
         UpdateJob(voiceJobId, "SENDING", 10);
 
@@ -648,8 +677,9 @@ public class VoiceCaptureAndSend : MonoBehaviour
             string json = www.downloadHandler.text;
             Debug.Log("[VoiceCaptureAndSend] Raw JSON: " + json);
 
-            AgentResult result = null;
-            try { result = JsonUtility.FromJson<AgentResult>(json); }
+            // ── Parse new gate response ───────────────────────────────────
+            TranscribeGateResponse gateResult = null;
+            try { gateResult = JsonUtility.FromJson<TranscribeGateResponse>(json); }
             catch (System.Exception e)
             {
                 Debug.LogError("[VoiceCaptureAndSend] JSON parse error: " + e);
@@ -658,83 +688,142 @@ public class VoiceCaptureAndSend : MonoBehaviour
                 yield break;
             }
 
-            if (result == null)
+            if (gateResult == null)
             {
                 SetHeaderLine("❌ empty_response");
                 FinishJob(voiceJobId, false, "empty_response");
                 yield break;
             }
 
-            if (transcriptText != null)
-                transcriptText.text = result.transcript;
+            if (transcriptText != null) transcriptText.text = gateResult.transcript;
 
-            UpdateJob(voiceJobId, "EXECUTING", 85);
-
-            bool executedAnything = false;
-            bool startedAnyAsyncJob = false;
-
-            if (result.commands != null && result.commands.Length > 0)
+            // ── Confirmation required — show dialog, wait for YES/NO ──────
+            if (gateResult.requires_confirmation)
             {
-                // If any run_code command is present, skip standalone generate_model —
-                // run_code handles generation itself when commandTarget is null.
-                bool hasRunCodeCommand = false;
-                foreach (var c in result.commands)
+                UpdateJob(voiceJobId, "AWAITING_CONFIRM", 70);
+                SetHeaderLine("❓ Waiting for confirmation...");
+
+                // Capture commands NOW from the already-parsed /transcribe response.
+                // DO NOT re-parse the /execute response body — JsonUtility silently
+                // fails on Command[] arrays, returning null and causing nothing to execute.
+                var capturedCommands  = gateResult.commands;
+                var capturedCommand   = gateResult.command;
+                var capturedTarget    = commandTarget;
+                var capturedLiveGaze  = liveGazeTarget;
+                var capturedAnchor    = commandWallAnchor;
+                var capturedJobId     = voiceJobId;
+                var capturedStartTime = requestStartTime;
+                bool confirmed        = false;
+
+                if (confirmationDialog != null)
                 {
-                    if (c == null || string.IsNullOrWhiteSpace(c.action)) continue;
-                    if (c.action.Trim().ToLowerInvariant() == "run_code")
+                    confirmationDialog.Show(
+                        gateResult.session_id,
+                        gateResult.confirmation_message,
+                        onExecute: _ => { confirmed = true; }
+                    );
+
+                    // Wait for YES (confirmed=true) or NO (_awaitingAnswer becomes false)
+                    float timeout = 60f;
+                    float waited  = 0f;
+                    while (!confirmed && confirmationDialog.IsPanelVisible && waited < timeout)
                     {
-                        hasRunCodeCommand = true;
-                        break;
-                    }
-                }
-
-                foreach (var c in result.commands)
-                {
-                    if (c == null) continue;
-
-                    string action = string.IsNullOrWhiteSpace(c.action)
-                        ? ""
-                        : c.action.Trim().ToLowerInvariant();
-
-                    // Skip generate_model when run_code is present —
-                    // run_code will generate the object itself if needed.
-                    if (hasRunCodeCommand && action == "generate_model")
-                    {
-                        Debug.Log("[VoiceCaptureAndSend] Skipping generate_model because run_code is present.");
-                        continue;
+                        waited += UnityEngine.Time.deltaTime;
+                        yield return null;
                     }
 
-                    bool startedJob = ApplyCommand(c, commandTarget, liveGazeTarget, commandWallAnchor, requestStartTime);
-                    startedAnyAsyncJob |= startedJob;
-                    executedAnything = true;
+                    // Give one extra frame for confirmed to be set by button callback
+                    yield return null;
                 }
-            }
-            else if (result.command != null)
-            {
-                startedAnyAsyncJob = ApplyCommand(result.command, commandTarget, liveGazeTarget, commandWallAnchor, requestStartTime);
-                executedAnything = true;
-            }
+                else
+                {
+                    confirmed = true;
+                    Debug.LogWarning("[VoiceCaptureAndSend] ConfirmationDialog not assigned — executing without confirmation.");
+                }
 
-            if (!executedAnything)
-            {
-                SetHeaderLine("⚠ No command executed.");
-                FinishJob(voiceJobId, false, "no_command");
+                if (!confirmed)
+                {
+                    SetHeaderLine("🚫 Command cancelled.");
+                    FinishJob(capturedJobId, false, "cancelled");
+                    _headerLine = "";
+                    RefreshJobsUI();
+                    yield break;
+                }
+
+                // YES confirmed — dispatch using the commands we already have
+                UpdateJob(capturedJobId, "EXECUTING", 85);
+                DispatchCommands(capturedCommands, capturedCommand,
+                                 capturedTarget, capturedLiveGaze, capturedAnchor,
+                                 capturedJobId, capturedStartTime);
                 yield break;
             }
 
-            if (stateStore != null) stateStore.RequestSave();
+            // ── No confirmation needed (no_action) ───────────────────────
+            UpdateJob(voiceJobId, "EXECUTING", 85);
+            DispatchCommands(gateResult.commands, gateResult.command,
+                             commandTarget, liveGazeTarget, commandWallAnchor,
+                             voiceJobId, requestStartTime);
+        }
+    }
 
-            FinishJob(voiceJobId, true, startedAnyAsyncJob ? "dispatched_async" : "done");
+    // ── Shared command dispatcher (used by both confirmed and immediate paths) ──
+    void DispatchCommands(Command[] commands, Command singleCommand,
+                          GameObject commandTarget, GameObject liveGazeTarget,
+                          WallAnchor commandWallAnchor, int voiceJobId, float requestStartTime)
+    {
+        bool executedAnything  = false;
+        bool startedAnyAsyncJob = false;
 
-            if (_autoLockedThisRun && !startedAnyAsyncJob && gazeInteractor != null)
+        if (commands != null && commands.Length > 0)
+        {
+            bool hasRunCodeCommand = false;
+            foreach (var c in commands)
             {
-                gazeInteractor.ClearLock();
-                _autoLockedThisRun = false;
+                if (c == null || string.IsNullOrWhiteSpace(c.action)) continue;
+                if (c.action.Trim().ToLowerInvariant() == "run_code") { hasRunCodeCommand = true; break; }
             }
 
-            _headerLine = "";
-            RefreshJobsUI();
+            foreach (var c in commands)
+            {
+                if (c == null) continue;
+                string action = string.IsNullOrWhiteSpace(c.action) ? "" : c.action.Trim().ToLowerInvariant();
+
+                if (hasRunCodeCommand && action == "generate_model")
+                {
+                    Debug.Log("[VoiceCaptureAndSend] Skipping generate_model because run_code is present.");
+                    continue;
+                }
+
+                bool startedJob = ApplyCommand(c, commandTarget, liveGazeTarget, commandWallAnchor, requestStartTime);
+                startedAnyAsyncJob |= startedJob;
+                executedAnything = true;
+            }
         }
+        else if (singleCommand != null)
+        {
+            startedAnyAsyncJob = ApplyCommand(singleCommand, commandTarget, liveGazeTarget, commandWallAnchor, requestStartTime);
+            executedAnything = true;
+        }
+
+        if (!executedAnything)
+        {
+            SetHeaderLine("⚠ No command executed.");
+            FinishJob(voiceJobId, false, "no_command");
+            return;
+        }
+
+        if (stateStore != null) stateStore.RequestSave();
+
+        FinishJob(voiceJobId, true, startedAnyAsyncJob ? "dispatched_async" : "done");
+
+        if (_autoLockedThisRun && !startedAnyAsyncJob && gazeInteractor != null)
+        {
+            gazeInteractor.ClearLock();
+            _autoLockedThisRun = false;
+        }
+
+        _headerLine = "";
+        RefreshJobsUI();
     }
 
     // =========================

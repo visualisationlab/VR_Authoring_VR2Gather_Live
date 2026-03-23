@@ -166,26 +166,43 @@ public class WallTextureApplier : MonoBehaviour
 
         float ts = (tileScale > 0f) ? tileScale : defaultTileScale;
 
-        // ✅ KEY FIX: always recompute from current world-space bounds.
-        // On restore the renderer is live and bounds are correct, so this
-        // produces the same tile count as the original apply — no stretching.
-        Vector2 tileCount = ComputeTileCount(r, ts);
+        // ✅ Try triplanar shader first for consistent tiling on all wall faces.
+        // Falls back to Standard if the shader isn't found in the project.
+        Shader shader = Shader.Find("Custom/Triplanar");
+        bool isTriplanar = shader != null;
 
-        Shader std = Shader.Find("Standard");
-        if (std == null)
+        if (!isTriplanar)
         {
-            Debug.LogError("[WallTextureApplier] Standard shader not found.");
+            Debug.LogWarning("[WallTextureApplier] Custom/Triplanar shader not found, falling back to Standard.");
+            shader = Shader.Find("Standard");
+        }
+
+        if (shader == null)
+        {
+            Debug.LogError("[WallTextureApplier] No usable shader found (tried Custom/Triplanar and Standard).");
             return;
         }
 
-        Material newMat = new Material(std);
-        newMat.name              = $"TexMat_{persist.id}";
-        newMat.mainTexture       = tex;
-        newMat.color             = Color.white;      // prevents tinting-to-black
-        newMat.SetFloat("_Metallic",    0f);
-        newMat.SetFloat("_Glossiness",  0.1f);
-        newMat.mainTextureScale  = tileCount;        // ✅ tiling, not stretching
-        newMat.mainTextureOffset = Vector2.zero;
+        Material newMat = new Material(shader);
+        newMat.name        = $"TexMat_{persist.id}";
+        newMat.mainTexture = tex;
+        newMat.color       = Color.white; // prevents tinting-to-black
+
+        if (isTriplanar)
+        {
+            // Triplanar projects in world-space: _Scale controls texture frequency.
+            // tileScale = world units per tile, so 1/tileScale = repeats per world unit.
+            newMat.SetFloat("_Scale", 1f / ts);
+        }
+        else
+        {
+            // Standard shader: compute UV tiling from world-space bounds as before.
+            Vector2 tileCount = ComputeTileCount(r, ts);
+            newMat.SetFloat("_Metallic",   0f);
+            newMat.SetFloat("_Glossiness", 0.1f);
+            newMat.mainTextureScale  = tileCount;
+            newMat.mainTextureOffset = Vector2.zero;
+        }
 
         // Apply to all sub-materials (multi-material renderers)
         var mats = r.materials;
@@ -208,6 +225,7 @@ public class WallTextureApplier : MonoBehaviour
     /// Uses the renderer's world-space bounds so a 10 m wall tiled at 1.8 m gets
     /// ~5-6 repeats, while a 1 m wall gets just 1.
     /// Falls back to (1,1) if bounds can't be determined.
+    /// Only used when falling back to the Standard shader.
     /// </summary>
     static Vector2 ComputeTileCount(Renderer r, float tileSizeInWorldUnits)
     {

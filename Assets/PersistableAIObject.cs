@@ -1,4 +1,4 @@
-﻿using UnityEngine;
+using UnityEngine;
 
 [DisallowMultipleComponent]
 public class PersistableAIObject : MonoBehaviour
@@ -15,6 +15,7 @@ public class PersistableAIObject : MonoBehaviour
 
     [Tooltip("AI-generated behaviour prompt (e.g. 'walk in a circle'). Persisted so the script is reattached on reload.")]
     public string behaviourPrompt = "";
+
     void Awake()
     {
         if (controllable == null) controllable = GetComponent<AIControllable>();
@@ -40,7 +41,6 @@ public class PersistableAIObject : MonoBehaviour
 
         string matName = "";
         bool hasMaterial = controllable != null && controllable.TryGetMaterialName(out matName);
-
 
         return new ObjectState
         {
@@ -94,27 +94,6 @@ public class PersistableAIObject : MonoBehaviour
         ApplySavedTextureIfAny();
     }
 
-    /*
-    void ApplySavedTextureIfAny()
-    {
-        var r = GetComponent<Renderer>();
-        if (r == null) return;
-
-        if (!string.IsNullOrEmpty(localTexturePath) && System.IO.File.Exists(localTexturePath))
-        {
-            byte[] bytes = System.IO.File.ReadAllBytes(localTexturePath);
-            var tex = new Texture2D(2, 2, TextureFormat.RGBA32, false);
-            tex.LoadImage(bytes);
-            tex.wrapMode = TextureWrapMode.Repeat;
-
-            r.material.mainTexture = tex;
-            r.material.mainTextureScale = new Vector2(tileScale, tileScale);
-        }
-    }
-
-    */
-
-
     void ApplySavedTextureIfAny()
     {
         var r = GetComponentInChildren<Renderer>(true);
@@ -130,16 +109,36 @@ public class PersistableAIObject : MonoBehaviour
 
             float ts = (tileScale > 0f) ? tileScale : 1.8f;
 
-            Shader std = Shader.Find("Standard");
-            if (std == null) return;
+            // ✅ Try triplanar shader first for consistent tiling on all wall faces.
+            // Falls back to Standard if the shader isn't in the project.
+            Shader shader = Shader.Find("Custom/Triplanar");
+            bool isTriplanar = shader != null;
 
-            Material newMat = new Material(std);
-            newMat.name = $"TexMat_{id}_RESTORED";
+            if (!isTriplanar)
+            {
+                Debug.LogWarning("[PersistableAIObject] Custom/Triplanar shader not found, falling back to Standard.");
+                shader = Shader.Find("Standard");
+            }
+
+            if (shader == null) return;
+
+            Material newMat = new Material(shader);
+            newMat.name        = $"TexMat_{id}_RESTORED";
             newMat.mainTexture = tex;
-            newMat.color = Color.white;             // ✅ critical
-            newMat.SetFloat("_Metallic", 0f);
-            newMat.SetFloat("_Glossiness", 0.1f);
-            newMat.mainTextureScale = new Vector2(ts, ts);
+            newMat.color       = Color.white; // ✅ critical — prevents tinting-to-black
+
+            if (isTriplanar)
+            {
+                // Triplanar projects in world-space: _Scale controls texture frequency.
+                // tileScale = world units per tile, so 1/tileScale = repeats per world unit.
+                newMat.SetFloat("_Scale", 1f / ts);
+            }
+            else
+            {
+                newMat.SetFloat("_Metallic",   0f);
+                newMat.SetFloat("_Glossiness", 0.1f);
+                newMat.mainTextureScale = new Vector2(ts, ts);
+            }
 
             // Apply to all sub-material slots
             var mats = r.materials;
@@ -155,7 +154,6 @@ public class PersistableAIObject : MonoBehaviour
             }
         }
     }
-
 
     [System.Serializable]
     public class ObjectState
