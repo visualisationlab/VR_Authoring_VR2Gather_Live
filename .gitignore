@@ -109,3 +109,5 @@ config-user.json
 
 # --- Generated assets (your pipeline outputs) ---
 Assets/Generated/
+Assets/Models/
+Assets/Models.meta
