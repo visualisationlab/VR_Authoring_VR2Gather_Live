@@ -151,7 +151,6 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 11ef14b72c71ec54496bd29284fa93a3, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  prefabPool: []
 --- !u!4 &18539526
 Transform:
   m_ObjectHideFlags: 0
@@ -3378,7 +3377,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &1031585658
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -5079,7 +5078,6 @@ GameObject:
   m_Component:
   - component: {fileID: 1830943048}
   - component: {fileID: 1830943047}
-  - component: {fileID: 1830943049}
   m_Layer: 0
   m_Name: GazeManager
   m_TagString: Untagged
@@ -5126,18 +5124,6 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!114 &1830943049
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1830943046}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 745f949f8d6b85d448ccc6a85bf866d9, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
 --- !u!1 &1874667268
 GameObject:
   m_ObjectHideFlags: 0
@@ -5658,28 +5644,18 @@ MonoBehaviour:
   microphoneDevice: 
   sampleRate: 16000
   maxRecordLengthSeconds: 300
-  rememberLastTarget: 1
-  rememberSeconds: 120
-  autoLockRememberedTarget: 1
+  serverUrl: http://localhost:8000/transcribe
+  textTo3dUrl: http://localhost:8000/api/text-to-3d
   modelSpawner: {fileID: 916773913}
   posterSpawner: {fileID: 0}
   stateStore: {fileID: 0}
-  serverUrl: http://localhost:8000/transcribe
-  textTo3dUrl: http://localhost:8000/api/text-to-3d
-  confirmationDialog: {fileID: 153690399}
   gazeInteractor: {fileID: 1830943047}
+  confirmationDialog: {fileID: 153690399}
   aiIntentText: {fileID: 679580216}
   transcriptText: {fileID: 679580216}
   recordingStatusText: {fileID: 1109230988}
   startKey: 114
   stopKey: 116
-  translateInCameraSpace: 0
-  autoConvertCmToMeters: 0
-  cmMin: 2
-  cmMax: 500
-  scalePercentThreshold: 3
-  minScaleFactor: 0.1
-  maxScaleFactor: 10
   defaultPosterWidthM: 1
   defaultPosterHeightM: 1
   completedJobLingerSeconds: 7

@@ -1,40 +1,29 @@
+using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
 
 /// <summary>
-/// Singleton manager that persists across scenes (DontDestroyOnLoad).
+/// Singleton that persists particle effects across scene reloads.
 ///
-/// USAGE:
-///   // Spawn a procedural fire at a world position and auto-save:
-///   ParticleEffectManager.Instance.AddEffect(new ParticleEffectData(transform.position, "fire"));
+/// Instead of storing particle settings, it stores the original behaviour_prompt
+/// and target name. On reload it re-runs the same run_code command through
+/// AICodeCommandHandler — rebuilding the particle system identically.
 ///
-///   // Spawn from a prefab and save:
-///   var data = new ParticleEffectData(transform.position, "custom") { prefabName = "MyFirePrefab" };
-///   ParticleEffectManager.Instance.AddEffect(data);
-///
-///   // Remove a specific effect:
+/// USAGE (called by AICodeCommandHandler automatically):
+///   ParticleEffectManager.Instance.SaveEffect(effectId, targetName, behaviourPrompt, spawnedGO);
 ///   ParticleEffectManager.Instance.RemoveEffect(effectId);
-///
-///   // Wipe everything:
 ///   ParticleEffectManager.Instance.ClearAllEffects();
-///
-/// The save file is written to Application.persistentDataPath/particle_effects.json
-/// and is loaded automatically on Awake every scene start.
 /// </summary>
 public class ParticleEffectManager : MonoBehaviour
 {
     // ------------------------------------------------------------------ singleton
     public static ParticleEffectManager Instance { get; private set; }
 
-    // ------------------------------------------------------------------ inspector
-    [Tooltip("Optional prefab pool. Key = prefabName in ParticleEffectData.")]
-    [SerializeField] private ParticlePrefabEntry[] prefabPool = new ParticlePrefabEntry[0];
-
     // ------------------------------------------------------------------ private
-    private readonly Dictionary<string, ParticleEffectData> _savedEffects = new();
-    private readonly Dictionary<string, GameObject>         _liveObjects  = new();
-    private readonly Dictionary<string, GameObject>         _prefabLookup = new();
+    private readonly Dictionary<string, ParticleEffectEntry> _saved = new();
+    private readonly Dictionary<string, GameObject>          _live  = new();
 
     private static string SavePath =>
         Path.Combine(Application.persistentDataPath, "particle_effects.json");
@@ -43,142 +32,167 @@ public class ParticleEffectManager : MonoBehaviour
 
     void Awake()
     {
-        // Singleton + survive scene loads
-        if (Instance != null && Instance != this)
-        {
-            Destroy(gameObject);
-            return;
-        }
+        if (Instance != null && Instance != this) { Destroy(gameObject); return; }
         Instance = this;
         DontDestroyOnLoad(gameObject);
-
-        // Build prefab lookup
-        foreach (var entry in prefabPool)
-            if (entry.prefab != null)
-                _prefabLookup[entry.name] = entry.prefab;
-
         LoadAndRespawn();
     }
 
     // ================================================================== public API
 
-    /// <summary>Spawns a new particle effect and saves it so it reappears after reload.</summary>
-    public string AddEffect(ParticleEffectData data)
+    /// <summary>
+    /// Called by AICodeCommandHandler after a particle script is successfully
+    /// compiled and attached. Saves the command so it can be replayed on reload.
+    /// </summary>
+    public void SaveEffect(string effectId, string targetName, string behaviourPrompt, GameObject spawnedGO)
     {
-        _savedEffects[data.effectId] = data;
-        SpawnOne(data);
+        _saved[effectId] = new ParticleEffectEntry
+        {
+            effectId        = effectId,
+            targetName      = targetName,
+            behaviourPrompt = behaviourPrompt,
+        };
+
+        _live[effectId] = spawnedGO;
+
+        // Stamp the tracker so we can find this GO by ID later
+        var tracker = spawnedGO.GetComponent<ParticleEffectTracker>()
+                   ?? spawnedGO.AddComponent<ParticleEffectTracker>();
+        tracker.effectId = effectId;
+
         Save();
-        return data.effectId;
+        Debug.Log($"[ParticleEffectManager] Saved effect '{effectId}' on '{targetName}'.");
     }
 
-    /// <summary>Convenience overload: create data inline.</summary>
-    public string AddEffect(Vector3 position, string effectType = "fire")
-        => AddEffect(new ParticleEffectData(position, effectType));
-
-    /// <summary>Removes a live effect and deletes it from the save file.</summary>
+    /// <summary>Removes a live particle effect and deletes it from the save file.</summary>
     public bool RemoveEffect(string effectId)
     {
-        if (_liveObjects.TryGetValue(effectId, out var go))
+        if (_live.TryGetValue(effectId, out var go))
         {
-            Destroy(go);
-            _liveObjects.Remove(effectId);
+            if (go != null) Destroy(go);
+            _live.Remove(effectId);
         }
-        bool removed = _savedEffects.Remove(effectId);
+
+        bool removed = _saved.Remove(effectId);
         if (removed) Save();
+
+        Debug.Log($"[ParticleEffectManager] Removed effect '{effectId}'.");
         return removed;
     }
 
-    /// <summary>Destroys all live effects and clears the save file.</summary>
+    /// <summary>Removes all live effects and clears the save file.</summary>
     public void ClearAllEffects()
     {
-        foreach (var go in _liveObjects.Values)
-            if (go) Destroy(go);
-        _liveObjects.Clear();
-        _savedEffects.Clear();
+        foreach (var go in _live.Values)
+            if (go != null) Destroy(go);
+
+        _live.Clear();
+        _saved.Clear();
         Save();
+
+        Debug.Log("[ParticleEffectManager] Cleared all effects.");
     }
 
-    /// <summary>Returns a copy of every saved effect descriptor.</summary>
-    public IEnumerable<ParticleEffectData> GetAllEffects() => _savedEffects.Values;
-
-    /// <summary>Updates position/settings for an existing effect and re-saves.</summary>
-    public void UpdateEffect(ParticleEffectData updated)
+    /// <summary>
+    /// Removes any live particle effects attached to a specific target GameObject.
+    /// Called automatically when a target object is deleted from the scene.
+    /// </summary>
+    public void RemoveEffectsOnTarget(string targetName)
     {
-        RemoveEffect(updated.effectId);
-        AddEffect(updated);
+        var toRemove = new List<string>();
+
+        foreach (var kv in _saved)
+            if (kv.Value.targetName == targetName)
+                toRemove.Add(kv.Key);
+
+        foreach (var id in toRemove)
+            RemoveEffect(id);
     }
 
     // ================================================================== save / load
 
     void Save()
     {
-        var file = new ParticleEffectSaveFile
-        {
-            effects = new ParticleEffectData[_savedEffects.Count]
-        };
-        _savedEffects.Values.CopyTo(file.effects, 0);
+        var entries = new ParticleEffectEntry[_saved.Count];
+        _saved.Values.CopyTo(entries, 0);
 
-        string json = JsonUtility.ToJson(file, prettyPrint: true);
+        string json = JsonUtility.ToJson(new ParticleEffectSaveFile { effects = entries }, prettyPrint: true);
         File.WriteAllText(SavePath, json);
-        Debug.Log($"[ParticleEffectManager] Saved {file.effects.Length} effects → {SavePath}");
+        Debug.Log($"[ParticleEffectManager] Saved {entries.Length} effect(s) → {SavePath}");
     }
 
     void LoadAndRespawn()
     {
         if (!File.Exists(SavePath))
         {
-            Debug.Log("[ParticleEffectManager] No save file found — starting fresh.");
+            Debug.Log("[ParticleEffectManager] No save file — starting fresh.");
             return;
         }
 
         string json = File.ReadAllText(SavePath);
         var file = JsonUtility.FromJson<ParticleEffectSaveFile>(json);
 
-        if (file?.effects == null)
+        if (file?.effects == null || file.effects.Length == 0)
         {
-            Debug.LogWarning("[ParticleEffectManager] Save file empty or corrupt.");
+            Debug.Log("[ParticleEffectManager] Save file empty.");
             return;
         }
 
-        foreach (var data in file.effects)
-        {
-            _savedEffects[data.effectId] = data;
-            SpawnOne(data);
-        }
+        Debug.Log($"[ParticleEffectManager] Replaying {file.effects.Length} saved particle effect(s)...");
 
-        Debug.Log($"[ParticleEffectManager] Loaded & respawned {file.effects.Length} effects.");
+        foreach (var entry in file.effects)
+            StartCoroutine(ReplayEffect(entry));
     }
 
-    // ================================================================== internal spawn
-
-    void SpawnOne(ParticleEffectData data)
+    /// <summary>
+    /// Waits one frame for the scene to finish loading, then re-runs the
+    /// original behaviour_prompt through AICodeCommandHandler.
+    /// </summary>
+    IEnumerator ReplayEffect(ParticleEffectEntry entry)
     {
-        GameObject go;
+        // Wait for scene and AICodeCommandHandler to be fully ready
+        yield return null;
+        yield return null;
 
-        if (!string.IsNullOrEmpty(data.prefabName) && _prefabLookup.TryGetValue(data.prefabName, out var prefab))
+        if (AICodeCommandHandler.Instance == null)
         {
-            // Prefab-based spawn
-            go = Instantiate(prefab, data.Position, Quaternion.Euler(data.Rotation));
-            go.transform.localScale = data.Scale;
-
-            var tracker = go.GetComponent<ParticleEffectTracker>()
-                        ?? go.AddComponent<ParticleEffectTracker>();
-            tracker.effectId = data.effectId;
-        }
-        else
-        {
-            // Procedural spawn
-            go = ProceduralParticleGenerator.Generate(data, transform);
+            Debug.LogWarning("[ParticleEffectManager] AICodeCommandHandler not found — cannot replay effect.");
+            yield break;
         }
 
-        _liveObjects[data.effectId] = go;
+        // Find the target GameObject by name
+        GameObject target = GameObject.Find(entry.targetName);
+        if (target == null)
+        {
+            Debug.LogWarning($"[ParticleEffectManager] Target '{entry.targetName}' not found in scene — skipping replay.");
+            yield break;
+        }
+
+        Debug.Log($"[ParticleEffectManager] Replaying effect on '{entry.targetName}'...");
+
+        // Re-run the exact same run_code command — this regenerates and reattaches
+        // the particle script just as if the user said the command again
+        AICodeCommandHandler.Instance.HandleRunCode(
+            behaviourPrompt:  entry.behaviourPrompt,
+            target:           target,
+            effectId:         entry.effectId,   // preserves the original ID
+            isReplay:         true              // skips re-saving to avoid duplicate entries
+        );
     }
 
-    // ================================================================== helper type
-    [System.Serializable]
-    public class ParticlePrefabEntry
+    // ================================================================== data types
+
+    [Serializable]
+    private class ParticleEffectEntry
     {
-        public string     name;
-        public GameObject prefab;
+        public string effectId;
+        public string targetName;
+        public string behaviourPrompt;
+    }
+
+    [Serializable]
+    private class ParticleEffectSaveFile
+    {
+        public ParticleEffectEntry[] effects = Array.Empty<ParticleEffectEntry>();
     }
 }

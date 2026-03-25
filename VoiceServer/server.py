@@ -1,6 +1,6 @@
 # =========================
 # LLM-DRIVEN XR SERVER
-# No keywords — pure natural language → LLM → Unity commands
+# No keywords — pure natural language -> LLM -> Unity commands
 # Includes: Meshy.ai 3D generation, OpenAI image/texture generation
 # =========================
 
@@ -8,7 +8,7 @@ from fastapi import FastAPI, File, Form, UploadFile, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from PIL import Image, ImageDraw
 import os, json, re, time, base64, io
 from datetime import datetime
@@ -16,6 +16,7 @@ from faster_whisper import WhisperModel
 from openai import OpenAI
 from dotenv import load_dotenv
 import requests
+import uuid as _uuid
 
 load_dotenv()
 
@@ -28,10 +29,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 print("OPENAI_API_KEY loaded:", bool(OPENAI_API_KEY))
 
-# ⭐ MODEL CHOICE:
-# "o4-mini"   → Best for this task: fast, cheap, excellent structured JSON output  ← RECOMMENDED
-# "gpt-4o"    → Also great, very fast, slightly weaker at strict JSON formatting
-# "o3"        → Most powerful reasoning, but slower and more expensive
+# "o4-mini" is good for structured JSON
 LLM_MODEL = "o4-mini"
 
 BASE_PATH = os.path.join(
@@ -52,9 +50,9 @@ TEXTURE_DIR = os.path.join(BASE_PATH, "textures")
 os.makedirs(TEXTURE_DIR, exist_ok=True)
 
 # Serve generated files to Unity over HTTP
-app.mount("/files",    StaticFiles(directory=MODEL_DIR),  name="files")
-app.mount("/posters",  StaticFiles(directory=POSTER_DIR), name="posters")
-app.mount("/textures", StaticFiles(directory=TEXTURE_DIR),name="textures")
+app.mount("/files", StaticFiles(directory=MODEL_DIR), name="files")
+app.mount("/posters", StaticFiles(directory=POSTER_DIR), name="posters")
+app.mount("/textures", StaticFiles(directory=TEXTURE_DIR), name="textures")
 
 # =========================
 # MESHY CONFIG
@@ -62,12 +60,15 @@ app.mount("/textures", StaticFiles(directory=TEXTURE_DIR),name="textures")
 MESHY_API_KEY = os.getenv("MESHY_API_KEY")
 print("MESHY_API_KEY loaded:", bool(MESHY_API_KEY))
 
-MESHY_BASE             = "https://api.meshy.ai"
-MESHY_TEXT2_3D_CREATE  = f"{MESHY_BASE}/openapi/v2/text-to-3d"
-MESHY_TEXT2_3D_GET     = f"{MESHY_BASE}/openapi/v2/text-to-3d"
+MESHY_BASE = "https://api.meshy.ai"
+MESHY_TEXT2_3D_CREATE = f"{MESHY_BASE}/openapi/v2/text-to-3d"
+MESHY_TEXT2_3D_GET = f"{MESHY_BASE}/openapi/v2/text-to-3d"
 
 # In-memory job tracker for background Meshy tasks
 jobs: Dict[str, Dict[str, Any]] = {}
+
+# In-memory store for commands awaiting user confirmation
+pending_commands: Dict[str, Dict[str, Any]] = {}
 
 # =========================
 # WHISPER
@@ -87,77 +88,37 @@ Your ONLY job is to output a valid JSON object with a "commands" array. No expla
 === AVAILABLE ACTIONS ===
 
 1. generate_model
-   - Creates a 3D object from a text description using Meshy.ai
-   - Required: "prompt" (string), "name" (string, PascalCase object name)
-   - Optional: "position" ({"x","y","z"}), "scale" ({"x","y","z"}), "stage" ("preview" or "refine"), "art_style" ("realistic" or "cartoon")
-   - Example: {"action":"generate_model","prompt":"wooden dining chair","name":"Chair_01","stage":"preview","art_style":"realistic"}
+   - Use ONLY when the user wants to generate a new 3D object/model from text.
+   - Required fields: "prompt"
+   - Optional fields: "name", "stage", "art_style"
 
 2. create_poster
-   - Generates and displays a flat image/poster on a wall or surface using DALL-E
-   - Required: "image_prompt" (string)
-   - Optional: "width_m" (float, meters), "height_m" (float, meters), "position" ({"x","y","z"})
-   - Example: {"action":"create_poster","image_prompt":"sunset over mountains","width_m":1.5,"height_m":1.0}
+   - Use ONLY when the user wants to generate a poster/image and place or use it as a poster.
+   - Required fields: "image_prompt"
+   - Optional fields: "width_m", "height_m"
 
 3. set_wall_texture
-   - Applies a generated seamless texture to a wall or surface using DALL-E
-   - Required: "texture_prompt" (string)
-   - Optional: "target" (string: "wall", "floor", "ceiling", or object name)
-   - Example: {"action":"set_wall_texture","texture_prompt":"rough stone bricks","target":"wall"}
+   - Use ONLY when the user wants to generate/apply a texture.
+   - Required fields: "texture_prompt"
+   - Optional fields: "target"
 
-4. translate
-   - Moves an object by a relative offset in meters
-   - Required: "dx" (float), "dy" (float), "dz" (float)
-   - Optional: "target" (string, object name — omit to move last selected object)
-   - Example: {"action":"translate","target":"Chair_01","dx":2.0,"dy":0,"dz":0}
-   - Note: dz=left/right (left=positive dz, right=negative dz), dy=up/down, dx=forward/back (forward=negative dx, back=positive dx)
+4. run_code
+   - This is the PRIMARY and DEFAULT action for EVERY actionable XR request that is NOT poster generation, texture generation, or 3D model generation.
+   - It generates and attaches a C# script at runtime.
+   - Use it for ALL of the following (and anything else not covered by the three actions above):
+     movement, rotation, scaling, color changes, duplication-like behaviours, particles,
+     animation, interaction, effects, procedural logic, following, constraints, stacking,
+     placement, lighting, deletion, spawning primitives, physics, UI, audio, and any
+     other Unity behaviour whatsoever.
+   - If in doubt, use run_code.
+   - Required fields:
+     - "targets": array of zero or more exact GameObject names
+     - "reference_objects": array of zero or more exact GameObject names
+     - "relation": optional relation string or null
+     - "behaviour_prompt": concise but implementation-oriented instruction for generated Unity C# code
 
-5. scale
-   - Scales an object uniformly or per axis
-   - Required: "factor" (float) OR "sx","sy","sz" (float, per axis)
-   - Optional: "target" (string)
-   - Example: {"action":"scale","target":"Chair_01","factor":1.5}
-
-6. set_color
-   - Changes the material color of an object
-   - Required: "color" (string: color name or hex like "#FF0000")
-   - Optional: "target" (string)
-   - Example: {"action":"set_color","target":"Chair_01","color":"red"}
-
-7. rotate
-   - Rotates an object by degrees
-   - Required: "rx" (float), "ry" (float), "rz" (float) — degrees around each axis
-   - Optional: "target" (string)
-   - Example: {"action":"rotate","target":"Chair_01","rx":0,"ry":90,"rz":0}
-
-8. delete_object
-   - Removes an object from the scene
-   - Required: "target" (string, object name)
-   - Example: {"action":"delete_object","target":"Chair_01"}
-
-9. run_code
-    - Generates and attaches a C# script to implement ANY behaviour at runtime
-    - Use for: animations, physics, particles, custom interactions, effects, or ANYTHING not covered by other actions
-    - FALLBACK RULE: if no other action fits the user intent, ALWAYS use run_code — never invent action names
-    - Required: "behaviour_prompt" (string — describe in detail what the C# script should do, including values and timing)
-    - Optional: "target" (string — omit to apply to last selected object)
-    - Example: {"action":"run_code","target":"Ball_01","behaviour_prompt":"make the object bounce up and down with sine wave motion, height 0.5m, period 1 second"}
-
-10. set_lighting
-    - Changes scene lighting
-    - Required: "preset" (string: "day", "night", "sunset", "studio", "dramatic") OR "color" (hex), "intensity" (0.0–2.0)
-    - Example: {"action":"set_lighting","preset":"sunset"}
-
-11. duplicate_object
-   - Duplicates/copies an existing object and places the copy at an offset from the original
-   - Required: "target" (string, name of the object to copy), "new_name" (string, PascalCase name for the copy)
-   - Optional: "dx" (float), "dy" (float), "dz" (float) — offset in meters from the original (default 0,0,0)
-   - Use this whenever the user says: "copy", "duplicate", "clone", "make another one", "make a copy of"
-   - Offset guide: "on top of" → dy=1.0, "next to" → dx=1.0, "behind" → dz=-1.0, "in front of" → dz=1.0
-   - Example: {"action":"duplicate_object","target":"Cube_01","new_name":"Cube_02","dx":0,"dy":1.0,"dz":0}
-
-12. no_action
-    - Use when the intent is unclear, the request is conversational, or nothing should happen
-    - Example: {"action":"no_action","reason":"unclear intent"}
+5. no_action
+   - Use when the input is purely conversational, unclear, or no XR action should happen.
 
 === OUTPUT FORMAT ===
 {
@@ -169,72 +130,97 @@ Your ONLY job is to output a valid JSON object with a "commands" array. No expla
 
 === GAZE TARGET ===
 The user is wearing an XR headset with eye tracking. The object they are currently looking at is provided as GAZE_TARGET.
-- If the user says "it", "this", "that", "the object", or refers to something without naming it — use GAZE_TARGET as the "target" value.
+- If the user says "it", "this", "that", "the object", or requests an effect on the looked-at object, use GAZE_TARGET as the primary acted-on object.
 - If GAZE_TARGET is "none" or empty, the user is not looking at any specific object.
-- NEVER guess or invent object names like "Cube_01" or "Chair_01" as target — always use GAZE_TARGET for the currently selected object.
-- If the action is global (lighting, create new object, textures) then "target" is not needed.
+- NEVER invent object names.
+- NEVER invent tags.
+- Prefer exact GameObject names from gaze and scene visibility/context.
 
-=== RULES ===
-- Output ONLY raw JSON. No markdown. No backticks. No explanations.
-- You may return MULTIPLE commands in one response (e.g. generate then color).
-- If the user wants a simple shape (cube/sphere), prefer spawn_primitive over generate_model.
-- If the user says "it" or "that", they mean the last object mentioned or created.
-- When translating directions: "left"→ positive dz, "right"→ negative dz, "up"→ positive dy, "down"→ negative dy, "forward"→ negative dx, "back"→ positive dx. NEVER mix these up — left/right is always dz, forward/back is always dx.
-- If intent is ambiguous but partially clear, make a reasonable interpretation.
-- Only return no_action if the input is purely conversational (greetings, questions, gibberish) with zero XR intent.
+=== CORE RULES ===
+- Use generate_model ONLY for generating new 3D objects/models from text.
+- Use create_poster ONLY for poster/image generation.
+- Use set_wall_texture ONLY for texture generation/application.
+- For EVERY other actionable XR instruction, use run_code.
+- NEVER return translate, scale, set_color, rotate, delete_object, duplicate_object, spawn_primitive, set_lighting, or any action name not listed above.
+- Output ONLY raw JSON.
 
-=== FALLBACK RULE (MOST IMPORTANT) ===
-If the user's intent is clear but NO existing action covers it, you MUST use run_code as a fallback.
-NEVER invent new action names. NEVER return no_action just because the action doesn't exist in the schema.
-run_code can do ANYTHING in Unity via generated C# — use it for: physics, animations, particles, custom behaviours, grouping, constraints, lighting effects, or ANY creative/interactive effect.
-When using run_code as a fallback, write a detailed "behaviour_prompt" describing exactly what the C# script should do so Unity can implement it correctly.
+=== run_code SCHEMA ===
+Each run_code command must use:
+- action: "run_code"
+- targets: array of zero or more exact GameObject names
+- reference_objects: array of zero or more exact GameObject names
+- relation: optional relation string or null
+- behaviour_prompt: concise implementation instruction for generated Unity C# code
+
+=== RULES FOR TARGETS VS REFERENCE OBJECTS ===
+- The object that the script should be attached to or directly modify belongs in "targets".
+- Supporting/context objects belong in "reference_objects".
+- If the user says "generate fire", "add smoke", "make this burn", "put water here", "add sparks to this", and GAZE_TARGET exists, put GAZE_TARGET in "targets".
+- Do NOT put the main acted-on object only in "reference_objects".
+- For relational commands like "put this on the table", put the moved object in "targets" and the supporting object in "reference_objects".
+
+=== HOW TO WRITE behaviour_prompt ===
+- For "put on ground", "place on floor", "drop to ground", or similar commands:
+  - preserve the target object's current x and z position unless the user explicitly asks to move it somewhere else
+  - only adjust y so the bottom of the object rests on the top surface of the ground/floor
+  - do not move the object to the center of the ground unless explicitly requested
+  - if a known floor/ground object exists, use it as a reference object
+
+The behaviour_prompt should read like a precise implementation brief for a Unity C# script.
+Include:
+- what object(s) are affected
+- any reference object(s) being used for context
+- whether the action happens once, continuously, on Start, on Update, on trigger, or on click
+- exact motion / color / scale / timing values
+- coordinate intent when relevant
+- any smoothing, interpolation, looping, spawn position, or cleanup rules
+
+=== PARTICLE / VFX RULES ===
+For fire, smoke, water, fountain, sparks, mist, explosion, waterfall, or similar effects:
+- Prefer creating and configuring a ParticleSystem directly in code.
+- Do NOT rely on inspector assignment.
+- Do NOT assume a prefab field is assigned.
+- The generated runtime code should work immediately after being attached.
+- Use renderer bounds of the target object to choose a sensible spawn point.
+- Explicitly say to create a child GameObject, add a ParticleSystem, configure it, and call Play().
+- If the user is looking at an object and asks for the effect on that object, put that object in "targets".
 
 === EXAMPLES ===
 
-User: "create a red wooden chair"
-{"commands":[{"action":"generate_model","prompt":"wooden chair","name":"Chair_01","stage":"preview","art_style":"realistic"},{"action":"set_color","target":"Chair_01","color":"red"}]}
+User: "put this on the ground"
+GAZE_TARGET: "Cube_01"
+{"commands":[{"action":"run_code","targets":["Cube_01"],"reference_objects":["ground_floor_window_frame"],"relation":"on_ground","behaviour_prompt":
+"on Start, place Cube_01 on top of ground_floor_window_frame by preserving Cube_01 current x and z position and only adjusting y so the bottom of Cube_01 
+rests on the ground surface without intersecting it; do not move Cube_01 to the center of the ground"}]}
+
+User: "move it 2 meters to the right"
+GAZE_TARGET: "Cube_03"
+{"commands":[{"action":"run_code","targets":["Cube_03"],"reference_objects":[],"relation":null,"behaviour_prompt":"move Cube_03 2 meters to the right relative to its current position when the script starts, then stop"}]}
+
+User: "turn it blue"
+GAZE_TARGET: "Sphere_01"
+{"commands":[{"action":"run_code","targets":["Sphere_01"],"reference_objects":[],"relation":null,"behaviour_prompt":"change the visible renderers of Sphere_01 and its children to blue when the script starts"}]}
+
+User: "put this object on the top of the table"
+GAZE_TARGET: "Cube_02"
+{"commands":[{"action":"run_code","targets":["Cube_02"],"reference_objects":["Tables"],"relation":"on_top","behaviour_prompt":"place Cube_02 centered on top of Tables using renderer bounds when the script starts so Cube_02 rests on the top surface without intersecting it"}]}
+
+User: "generate fire"
+GAZE_TARGET: "Wall_1"
+{"commands":[{"action":"run_code","targets":["Wall_1"],"reference_objects":[],"relation":null,"behaviour_prompt":"on Start, create a child GameObject on Wall_1, add and configure a looping fire ParticleSystem directly in code, place it near the bottom center of Wall_1 using combined renderer bounds, and call Play immediately; do not require any prefab or inspector assignment"}]}
+
+User: "add smoke to this"
+GAZE_TARGET: "Barrel_01"
+{"commands":[{"action":"run_code","targets":["Barrel_01"],"reference_objects":[],"relation":null,"behaviour_prompt":"on Start, create a child GameObject on Barrel_01, add and configure a looping smoke ParticleSystem directly in code, place it near the top center of Barrel_01 using renderer bounds, and call Play immediately; do not require any prefab or inspector assignment"}]}
 
 User: "make a poster of a snowy mountain landscape"
 {"commands":[{"action":"create_poster","image_prompt":"snowy mountain landscape","width_m":1.5,"height_m":1.0}]}
 
 User: "apply brick texture to the wall"
-{"commands":[{"action":"set_wall_texture","texture_prompt":"old red brick wall","target":"wall"}]}
+{"commands":[{"action":"set_wall_texture","texture_prompt":"old red brick wall","target":"Wall"}]}
 
-User: "move it 2 meters to the right and 1 meter up"
-GAZE_TARGET: "Cube_03"
-{"commands":[{"action":"translate","target":"Cube_03","dx":0,"dy":1.0,"dz":-2.0,"coord_space":"world"}]}
-
-User: "make it twice as big"
-GAZE_TARGET: "Chair_02"
-{"commands":[{"action":"scale","target":"Chair_02","factor":2.0}]}
-
-User: "turn it blue"
-GAZE_TARGET: "Sphere_01"
-{"commands":[{"action":"set_color","target":"Sphere_01","color":"blue","coord_space":"world"}]}
-
-User: "make it bounce"
-GAZE_TARGET: "Ball_01"
-{"commands":[{"action":"run_code","target":"Ball_01","behaviour_prompt":"make the object bounce up and down continuously with a height of 0.5 meters and smooth easing"}]}
-
-User: "make it spin"
-GAZE_TARGET: "Cube_01"
-{"commands":[{"action":"run_code","target":"Cube_01","behaviour_prompt":"rotate the object around its Y axis continuously at 90 degrees per second"}]}
-
-User: "make a copy of this and put it on top"
-GAZE_TARGET: "Cube_01"
-{"commands":[{"action":"duplicate_object","target":"Cube_01","new_name":"Cube_02","dx":0,"dy":1.0,"dz":0}]}
-
-User: "delete this"
-GAZE_TARGET: "Table_02"
-{"commands":[{"action":"delete_object","target":"Table_02"}]}
-
-User: "rotate it 45 degrees to the left"
-GAZE_TARGET: "Chair_01"
-{"commands":[{"action":"rotate","target":"Chair_01","rx":0,"ry":-45,"rz":0}]}
-
-User: "make it follow me"
-GAZE_TARGET: "Lamp_01"
-{"commands":[{"action":"run_code","target":"Lamp_01","behaviour_prompt":"make the object smoothly follow the XR player/camera position, maintaining a distance of 1.5 meters in front and 0.5 meters below eye level, using Lerp for smooth movement"}]}
+User: "create a realistic wooden chair"
+{"commands":[{"action":"generate_model","prompt":"realistic wooden chair","name":"Wooden_Chair","stage":"preview","art_style":"realistic"}]}
 
 User: "hello how are you"
 {"commands":[{"action":"no_action","reason":"conversational input, no XR action needed"}]}
@@ -316,7 +302,6 @@ def _generate_with_meshy_background(prompt: str, name: str, stage: str, art_styl
             "meshy_status": "PENDING", "progress": 0, "error": "",
         }
 
-        # --- Preview stage ---
         preview_task_id = _meshy_create_task(
             mode="preview",
             payload={"prompt": prompt, "art_style": art_style, "should_remesh": True},
@@ -341,17 +326,15 @@ def _generate_with_meshy_background(prompt: str, name: str, stage: str, art_styl
         if preview_task is None:
             raise RuntimeError("Timed out waiting for Meshy preview task.")
 
-        # If only preview requested, download and done
         if (stage or "preview").lower() == "preview":
             glb_url = preview_task["model_urls"]["glb"]
             _download_to_file(glb_url, out_glb)
             jobs[safe]["status"] = "DONE"
             jobs[safe]["meshy_status"] = "SUCCEEDED"
             jobs[safe]["progress"] = 100
-            print(f"[meshy] preview done → {out_glb}", flush=True)
+            print(f"[meshy] preview done -> {out_glb}", flush=True)
             return
 
-        # --- Refine stage ---
         refine_task_id = _meshy_create_task(
             mode="refine",
             payload={"preview_task_id": preview_task_id, "enable_pbr": True},
@@ -381,7 +364,7 @@ def _generate_with_meshy_background(prompt: str, name: str, stage: str, art_styl
         jobs[safe]["status"] = "DONE"
         jobs[safe]["meshy_status"] = "SUCCEEDED"
         jobs[safe]["progress"] = 100
-        print(f"[meshy] refine done → {out_glb}", flush=True)
+        print(f"[meshy] refine done -> {out_glb}", flush=True)
 
     except Exception as e:
         print("[meshy] ERROR:", e, flush=True)
@@ -390,7 +373,6 @@ def _generate_with_meshy_background(prompt: str, name: str, stage: str, art_styl
             "task_id": jobs.get(safe, {}).get("task_id"),
             "meshy_status": "FAILED", "progress": 0, "error": str(e),
         }
-
 
 # =========================
 # IMAGE GENERATION HELPERS
@@ -421,7 +403,6 @@ def _make_ai_texture(prompt: str, out_path: str, size_px: int = 1024):
 
 
 def _make_placeholder_poster(prompt: str, out_path: str, w: int, h: int):
-    """Fallback placeholder if image generation fails."""
     img = Image.new("RGB", (w, h), (245, 245, 245))
     draw = ImageDraw.Draw(img)
     draw.rectangle([8, 8, w - 8, h - 8], outline=(40, 40, 40), width=4)
@@ -433,7 +414,6 @@ def _make_placeholder_poster(prompt: str, out_path: str, w: int, h: int):
         draw.text((30, y), ln, fill=(20, 20, 20))
         y += 28
     img.save(out_path, "PNG")
-
 
 # =========================
 # TEXT-TO-3D ENDPOINT
@@ -458,7 +438,6 @@ def text_to_3d(req: TextTo3DRequest, background_tasks: BackgroundTasks):
             content={"status": "FAILED", "progress": 0, "message": "MESHY_API_KEY missing."},
         )
 
-    # Already generated — return immediately
     if os.path.exists(glb_path):
         return JSONResponse(status_code=200, content={
             "status": "SUCCEEDED", "progress": 100,
@@ -467,21 +446,18 @@ def text_to_3d(req: TextTo3DRequest, background_tasks: BackgroundTasks):
 
     job = jobs.get(safe)
 
-    # Job still running
     if job and job.get("status") == "RUNNING":
         return JSONResponse(status_code=202, content={
             "status": job.get("meshy_status", "IN_PROGRESS"),
             "progress": int(job.get("progress", 0) or 0),
         })
 
-    # Previous job errored
     if job and job.get("status") == "ERROR":
         return JSONResponse(status_code=500, content={
             "status": "FAILED", "progress": 0,
             "message": job.get("error", "Unknown error"),
         })
 
-    # Start new background job
     stage = (req.stage or "preview").lower()
     art_style = (req.art_style or "realistic").lower()
     print(f"[text-to-3d] starting name={req.name} safe={safe} stage={stage} art_style={art_style}", flush=True)
@@ -493,7 +469,6 @@ def text_to_3d(req: TextTo3DRequest, background_tasks: BackgroundTasks):
 
     background_tasks.add_task(_generate_with_meshy_background, req.prompt, req.name, stage, art_style)
     return JSONResponse(status_code=202, content={"status": "PENDING", "progress": 0})
-
 
 # =========================
 # POSTER IMAGE ENDPOINT
@@ -523,7 +498,6 @@ def poster_image(req: PosterImageRequest):
 
     return JSONResponse(content={"image_url": f"http://localhost:8000/posters/{filename}"})
 
-
 # =========================
 # TEXTURE IMAGE ENDPOINT
 # =========================
@@ -545,29 +519,135 @@ def texture_image(req: TextureImageRequest):
     _make_ai_texture(prompt, out_path, size_px=size_px)
     return JSONResponse(content={"image_url": f"http://localhost:8000/textures/{filename}"})
 
-
 # =========================
 # LLM DECISION ENGINE
 # =========================
 
 def extract_json(text: str) -> dict:
-    """Robustly extracts JSON from LLM output."""
     text = re.sub(r"```(?:json)?", "", text).strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
+
     match = re.search(r'\{[\s\S]*\}', text)
     if match:
         try:
             return json.loads(match.group())
         except json.JSONDecodeError:
             pass
+
     return {"commands": [{"action": "no_action", "reason": "LLM returned unparseable output"}]}
 
 
+def _commands_to_sentence(commands: list) -> str:
+    """
+    Converts commands into a short confirmation sentence for Unity.
+    """
+    if not commands:
+        return ""
+
+    parts = []
+    for cmd in commands:
+        action = cmd.get("action", "no_action")
+        targets = cmd.get("targets") or []
+        refs = cmd.get("reference_objects") or []
+
+        primary = None
+        if targets:
+            primary = targets[0]
+        elif refs:
+            primary = refs[0]
+        else:
+            primary = "the object"
+
+        if action == "run_code":
+            behaviour = cmd.get("behaviour_prompt", "custom behaviour")
+            short = behaviour[:90] + "..." if len(behaviour) > 90 else behaviour
+            parts.append(f"Run script on {primary}: {short}")
+
+        elif action == "generate_model":
+            prompt = cmd.get("prompt", "object")
+            parts.append(f"Generate a 3D model of '{prompt}'")
+
+        elif action == "create_poster":
+            prompt = cmd.get("image_prompt") or cmd.get("prompt", "image")
+            parts.append(f"Create a poster: '{prompt}'")
+
+        elif action == "set_wall_texture":
+            prompt = cmd.get("texture_prompt", "texture")
+            parts.append(f"Apply texture '{prompt}' to {primary}")
+
+        elif action == "no_action":
+            pass
+
+        else:
+            parts.append(f"Execute '{action}' on {primary}")
+
+    return ". ".join(parts) + "." if parts else ""
+
+
+def _print_llm_debug(transcript: str, gaze_target: str, commands: list, reasoning: str = ""):
+    print("\n========== XR PIPELINE DEBUG ==========")
+    print()
+    print(f"Transcript: {transcript}")
+    print()
+    print(f"Gaze Target: {gaze_target}")
+    print()
+
+    if not commands:
+        print("Intent: no_action")
+        print()
+        print("Behaviour Prompt: N/A")
+        print()
+        print("Reasoning: No commands returned.")
+        print()
+        print("=======================================\n")
+        return
+
+    for i, cmd in enumerate(commands, start=1):
+        action = cmd.get("action", "no_action")
+        targets = cmd.get("targets", [])
+        reference_objects = cmd.get("reference_objects", [])
+        relation = cmd.get("relation", None)
+        behaviour_prompt = cmd.get("behaviour_prompt", "N/A")
+        reason = cmd.get("reason", "")
+
+        print(f"--- Command {i} ---")
+        print()
+        print(f"Intent (action): {action}")
+        print()
+        print(f"Targets: {targets}")
+        print()
+        print(f"Reference Objects: {reference_objects}")
+        print()
+        if relation is not None:
+            print(f"Relation: {relation}")
+            print()
+        if action == "generate_model":
+            print(f"Prompt: {cmd.get('prompt', '')}")
+            print()
+        elif action == "create_poster":
+            print(f"Image Prompt: {cmd.get('image_prompt', '')}")
+            print()
+        elif action == "set_wall_texture":
+            print(f"Texture Prompt: {cmd.get('texture_prompt', '')}")
+            print()
+        else:
+            print(f"Behaviour Prompt: {behaviour_prompt}")
+            print()
+        if reason:
+            print(f"Reason: {reason}")
+            print()
+
+    if reasoning:
+        print(f"Confirmation Summary: {reasoning}")
+        print()
+
+    print("=======================================\n")
+
+
 def llm_decide(transcript: str, gaze_target: str = "none") -> dict:
-    """Sends transcript + gaze context to the LLM and returns a parsed commands dict."""
     if not transcript:
         return {"commands": [{"action": "no_action", "reason": "empty transcript"}]}
 
@@ -584,65 +664,94 @@ def llm_decide(transcript: str, gaze_target: str = "none") -> dict:
         )
 
         raw = response.choices[0].message.content.strip()
-
-        # Ask LLM to explain its decision in plain English
-        reasoning_response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": "You are a concise explainer. In 1-2 sentences, explain what action was chosen and why, based on the user's speech and gaze target. Be direct and plain — no JSON, no bullet points."},
-                {"role": "user", "content": f'User said: "{transcript}"\nGaze target: "{gaze_target}"\nDecided commands: {raw}'}
-            ],
-            max_completion_tokens=150,
-        )
-        reasoning = reasoning_response.choices[0].message.content.strip()
-
-        return {**extract_json(raw), "_reasoning": reasoning}
+        parsed = extract_json(raw)
+        reasoning = _commands_to_sentence(parsed.get("commands", []))
+        return {**parsed, "_reasoning": reasoning}
 
     except Exception as e:
         print(f"[LLM error]: {e}")
         return {"commands": [{"action": "no_action", "reason": f"LLM error: {str(e)}"}]}
 
+# =========================
+# TRANSCRIBE-ONLY ENDPOINT
+# =========================
+
+@app.post("/transcribe-only")
+async def transcribe_only(
+    audio: UploadFile = File(...),
+    gaze_target: Optional[str] = Form(default="none"),
+):
+    """
+    Step 1 of the two-step pipeline.
+    Runs Whisper on the audio and returns the transcript immediately,
+    without calling the LLM.
+    """
+    audio_bytes = await audio.read()
+    with open(TEMP_AUDIO_PATH, "wb") as f:
+        f.write(audio_bytes)
+
+    gaze_target = gaze_target.strip() if gaze_target else "none"
+
+    t0 = time.time()
+    segments, _info = whisper_model.transcribe(TEMP_AUDIO_PATH, beam_size=5, task="translate")
+    transcript = "".join(s.text for s in segments).strip()
+    whisper_time = round(time.time() - t0, 3)
+    print(f"[Whisper-only] ({whisper_time}s): '{transcript}'")
+
+    return JSONResponse(content={
+        "transcript": transcript,
+        "gaze_target": gaze_target,
+        "whisper_ms": int(whisper_time * 1000),
+    })
 
 # =========================
 # TRANSCRIBE ENDPOINT
 # =========================
+
+def _is_actionable(commands: list) -> bool:
+    return any(cmd.get("action", "no_action") != "no_action" for cmd in commands)
+
+
+def _build_confirmation_message(commands: list, reasoning: str) -> str:
+    if reasoning:
+        return reasoning
+    actions = [cmd.get("action", "no_action") for cmd in commands]
+    return f"Execute the following action(s): {', '.join(actions)}?"
+
 
 @app.post("/transcribe")
 async def transcribe(
     audio: UploadFile = File(...),
     gaze_target: Optional[str] = Form(default="none"),
 ):
-    # Save uploaded audio
+    """
+    Full pipeline: Whisper -> LLM -> confirmation gate.
+    """
     with open(TEMP_AUDIO_PATH, "wb") as f:
         f.write(await audio.read())
 
     gaze_target = gaze_target.strip() if gaze_target else "none"
-    print(f"[Gaze target]: '{gaze_target}'")
+    print(f"\n[Gaze target]: '{gaze_target}'\n")
 
-    # Whisper transcription (translates any language → English)
     t0 = time.time()
-    segments, info = whisper_model.transcribe(TEMP_AUDIO_PATH, beam_size=5, task="translate")
+    segments, _info = whisper_model.transcribe(TEMP_AUDIO_PATH, beam_size=5, task="translate")
     transcript = "".join(s.text for s in segments).strip()
     whisper_time = round(time.time() - t0, 3)
-    print(f"[Whisper] ({whisper_time}s): '{transcript}'")
+    print(f"[Whisper] ({whisper_time}s): '{transcript}'\n")
 
-    # LLM decision
     t1 = time.time()
     result = llm_decide(transcript, gaze_target=gaze_target)
     llm_time = round(time.time() - t1, 3)
 
-    commands = result.get("commands", [{"action": "no_action"}])
+    commands = result.get("commands", [{"action": "no_action"}]) or [{"action": "no_action"}]
     reasoning = result.get("_reasoning", "")
-    if not commands:
-        commands = [{"action": "no_action"}]
 
-    print("")
-    print(f"[LLM] ({llm_time}s) → {json.dumps(commands)}")
+    print(f"\n[LLM] ({llm_time}s) -> {json.dumps(commands)}\n")
     if reasoning:
-        print(f"[Reasoning] {reasoning}")
-    print("")
+        print(f"[Reasoning] {reasoning}\n")
 
-    # Log to file
+    _print_llm_debug(transcript, gaze_target, commands, reasoning)
+
     log_entry = {
         "time": datetime.now().isoformat(),
         "transcript": transcript,
@@ -654,18 +763,88 @@ async def transcribe(
     with open(TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(log_entry) + "\n")
 
+    meta = {
+        "whisper_ms": log_entry["whisper_ms"],
+        "llm_ms": log_entry["llm_ms"],
+        "model": LLM_MODEL,
+    }
+
+    if _is_actionable(commands):
+        session_id = str(_uuid.uuid4())
+        confirmation_message = _build_confirmation_message(commands, reasoning)
+
+        pending_commands[session_id] = {
+            "commands": commands,
+            "transcript": transcript,
+            "gaze_target": gaze_target,
+            "created_at": time.time(),
+        }
+
+        print(f"[Pending] session={session_id}  msg='{confirmation_message}'\n")
+
+        return JSONResponse(content={
+            "transcript": transcript,
+            "gaze_target": gaze_target,
+            "requires_confirmation": True,
+            "session_id": session_id,
+            "confirmation_message": confirmation_message,
+            "commands": commands,
+            "command": commands[0] if commands else {"action": "no_action"},
+            "meta": meta,
+        })
+
     return JSONResponse(content={
         "transcript": transcript,
         "gaze_target": gaze_target,
+        "requires_confirmation": False,
         "commands": commands,
         "command": commands[0],
-        "meta": {
-            "whisper_ms": log_entry["whisper_ms"],
-            "llm_ms": log_entry["llm_ms"],
-            "model": LLM_MODEL,
-        }
+        "meta": meta,
     })
 
+# =========================
+# EXECUTE ENDPOINT
+# =========================
+
+class ConfirmRequest(BaseModel):
+    session_id: str
+
+
+@app.post("/execute")
+def execute(req: ConfirmRequest):
+    entry = pending_commands.pop(req.session_id, None)
+    if entry is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "session_id not found or already consumed"},
+        )
+
+    commands = entry["commands"]
+    print(f"[Execute] session={req.session_id} -> {json.dumps(commands)}\n")
+
+    return JSONResponse(content={
+        "status": "executed",
+        "session_id": req.session_id,
+        "commands": commands,
+        "command": commands[0],
+        "transcript": entry.get("transcript", ""),
+        "gaze_target": entry.get("gaze_target", "none"),
+    })
+
+# =========================
+# CANCEL ENDPOINT
+# =========================
+
+@app.post("/cancel")
+def cancel(req: ConfirmRequest):
+    discarded = pending_commands.pop(req.session_id, None)
+    if discarded:
+        print(f"[Cancel] session={req.session_id} discarded.")
+        return JSONResponse(content={"status": "cancelled", "session_id": req.session_id})
+    return JSONResponse(
+        status_code=404,
+        content={"error": "session_id not found or already consumed"},
+    )
 
 # =========================
 # HEALTH CHECK
@@ -680,7 +859,6 @@ async def health():
         "meshy": bool(MESHY_API_KEY),
         "openai_images": bool(OPENAI_API_KEY),
     }
-
 
 # =========================
 # RUN

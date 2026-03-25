@@ -89,8 +89,10 @@ public class RuntimeBehaviourRegistry : MonoBehaviour
         return sb.ToString();
     }
 
-    public bool RegisterAndAttach(GameObject target, string csharpCode)
+    public bool RegisterAndAttach(GameObject target, string csharpCode, out string compileError)
     {
+        compileError = null;
+
         if (target == null || string.IsNullOrWhiteSpace(csharpCode))
             return false;
 

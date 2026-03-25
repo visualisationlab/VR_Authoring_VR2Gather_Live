@@ -40,6 +40,11 @@ public class AICodeCommandHandler : MonoBehaviour
         "Write code as if it will be attached directly to that object " +
         "(use 'this.gameObject' or 'transform' to refer to it). " +
         "Reply with ONLY a single fenced ```csharp code block. Rules:\n" +
+        "  - Particle effects must respect realistic room-scale size suitable for XR environments.\n" +
+        "    Default particle sizes should be small and subtle unless the user explicitly requests large effects.\n" +
+        "    Use startSize typically in the range of 0.02 to 0.2 units.\n" +
+        "    Avoid particles that are so large that they cover large parts of walls, tables, or the camera view.\n" +
+        "    Particle systems should enhance the scene, not dominate it.\n" +
         "  - One class per response, must inherit MonoBehaviour.\n" +
         "  - Only use: UnityEngine, System, System.Collections, System.Collections.Generic.\n" +
         "  - No Editor-only APIs. No ML-Agents. No external packages.\n" +
@@ -47,59 +52,44 @@ public class AICodeCommandHandler : MonoBehaviour
         "  - Prefer transform-based movement/rotation.\n" +
         "  - Do not assume Renderer, Animator, or Rigidbody exists on the same GameObject.\n" +
         "  - If visual changes are needed, prefer GetComponentsInChildren<Renderer>().\n" +
+        "  - For particle effects: build the ParticleSystem entirely in code using AddComponent<ParticleSystem>().\n" +
+        "    Configure all modules (main, emission, shape, colorOverLifetime, sizeOverLifetime, noise,\n" +
+        "    velocityOverLifetime, collision, trails, subEmitters) as appropriate for the effect type.\n" +
+        "    Always call ps.Play() at the end. Parent the particle GameObject to the target object.\n" +
+        "  - For particle effects: build the ParticleSystem entirely in code using AddComponent<ParticleSystem>().\n" +
+        "    Configure all modules (main, emission, shape, colorOverLifetime, sizeOverLifetime, noise,\n" +
+        "    velocityOverLifetime, collision, trails, subEmitters) as appropriate for the effect type.\n" +
+        "    Always call ps.Play() at the end. Parent the particle GameObject to the target object.\n" +
+        "  - For smoke, fire, water, fountain, sparks, mist, or similar particle effects:\n" +
+        "    ALWAYS create the ParticleSystem directly in code.\n" +
+        "    ALWAYS assign a valid material to the ParticleSystemRenderer.\n" +
+        "    NEVER leave the particle system without a material, because that causes pink or magenta rendering.\n" +
+        "    Create a Material in code using a shader compatible with the current render pipeline.\n" +
+        "    First try Shader.Find(\"Particles/Standard Unlit\").\n" +
+        "    If that returns null, fallback to Shader.Find(\"Legacy Shaders/Particles/Alpha Blended\").\n" +
+        "    After creating the ParticleSystem, get its ParticleSystemRenderer and assign a new Material using the valid shader.\n" +
+        "    Example pattern: var psRenderer = ps.GetComponent<ParticleSystemRenderer>(); if (psRenderer != null && validShader != null) psRenderer.material = new Material(validShader);\n" +
+        "    Configure the particle system so the effect is immediately visible and visually correct.\n" +
+        "  - For smoke specifically:\n" +
+        "    Use small, soft particles (typically 0.05 to 0.2).\n" +
+        "    Use slow upward motion and fading alpha.\n" +
+        "    Use grey or dark colors.\n" +
+        "    Enable color over lifetime with fading alpha so the particles fade to transparent.\n" +
+        "    Use low speed and upward motion.\n" +
+        "    - For water or fountain effects:\n" +
+        "    Use small droplet-like particles.\n" +
+        "    Avoid large splash quads.\n" +
+        "    Keep particle size modest (typically 0.02 to 0.1).\n" +
+        "    Use higher speed but small size for realism.\n" +
+        "    Use soft spread with a cone, sphere, circle, or rectangle shape as appropriate.\n" +
+        "  - The generated script must work immediately after being attached, without requiring any manual setup in the Unity Inspector.\n" +
+        "  PARTICLE API RULES — these are hard Unity 2022 constraints, never violate them:\n" +
+        "  - NEVER use ParticleSystemShapeType.Plane — it does not exist. Use ParticleSystemShapeType.Rectangle instead.\n" +
+        "  - NEVER use lights.color on ParticleSystem.LightsModule — that property does not exist.\n" +
+        "    To tint particle lights, get the Light component from a child GameObject and set light.color there.\n" +
+        "  - NEVER use ParticleSystemShapeType.Cone as a flat emitter — use Rectangle or Circle instead.\n" +
         "  - Do NOT include any explanation outside the code block.\n\n" +
         "Current scene objects:\n{SCENE_CONTEXT}";
-
-    // ------------------------------------------------------------------ particle intent detection
-
-    static readonly (string[] keywords, string effectType)[] kParticleIntents =
-    {
-        (new[]{ "water", "fountain", "flow", "stream", "waterfall" }, "water"),
-        (new[]{ "fire",  "flame",    "burn", "blaze"               }, "fire"),
-        (new[]{ "smoke", "fog",      "mist", "haze"                }, "smoke"),
-        (new[]{ "spark", "sparkle",  "glitter", "twinkle"          }, "sparkle"),
-        (new[]{ "explosion", "explode", "blast", "boom"            }, "explosion"),
-    };
-
-    /// <summary>
-    /// Returns true (and spawns the effect) if the command maps to a known particle type.
-    /// Bypasses GPT entirely — fast, reliable, no compilation needed.
-    /// </summary>
-    bool TryHandleAsParticleEffect(string command, GameObject target)
-    {
-        if (ParticleEffectManager.Instance == null) return false;
-
-        string lower = command.ToLowerInvariant();
-
-        foreach (var (keywords, effectType) in kParticleIntents)
-        {
-            foreach (var kw in keywords)
-            {
-                if (!lower.Contains(kw)) continue;
-
-                Vector3 spawnPos = target != null
-                    ? target.transform.position
-                    : Vector3.zero;
-
-                var data = new ParticleEffectData(spawnPos, effectType)
-                {
-                    loop = true
-                };
-
-                // For water: orient so it flows downward
-                if (effectType == "water")
-                {
-                    data.rotX = 0f; // ProceduralParticleGenerator sets shape rotation internally
-                }
-
-                string id = ParticleEffectManager.Instance.AddEffect(data);
-                Log($"Particle effect '{effectType}' spawned (id={id[..8]}) on '{(target != null ? target.name : "world")}'.");
-                return true;
-            }
-        }
-
-        return false;
-    }
 
     // ------------------------------------------------------------------ lifecycle
 
@@ -114,19 +104,16 @@ public class AICodeCommandHandler : MonoBehaviour
         if (string.IsNullOrWhiteSpace(openAiApiKey))
             Debug.LogWarning("[AICodeCommandHandler] No OpenAI API key found.");
         else
-            Debug.Log("[AICodeCommandHandler] Ready");
+            Debug.Log("[AICodeCommandHandler] Ready.");
     }
 
     // ------------------------------------------------------------------ public API
 
     /// <summary>
-    /// Main entry point — target is resolved automatically:
-    ///   1. Raycast from camera centre (what the player is looking at).
-    ///   2. Name match — does any scene object's name appear in the command?
-    ///   3. Fallback to the last successfully resolved target.
-    /// The generated script is compiled and attached to that object immediately.
-    /// Particle-effect commands (fire, water, smoke, etc.) are intercepted
-    /// before reaching GPT and dispatched directly to ParticleEffectManager.
+    /// Main entry point from the XR server pipeline.
+    /// Called with the behaviour_prompt and resolved target from run_code command.
+    /// Generates a C# script via GPT and attaches it to the target.
+    /// If the behaviour involves particles, also saves to ParticleEffectManager for persistence.
     /// </summary>
     public void HandleCommand(string naturalLanguageCommand)
     {
@@ -134,9 +121,7 @@ public class AICodeCommandHandler : MonoBehaviour
         HandleCommand(naturalLanguageCommand, target);
     }
 
-    /// <summary>
-    /// Explicit overload — supply a target directly if you already know it.
-    /// </summary>
+    /// <summary>Explicit overload — supply a target directly if you already know it.</summary>
     public void HandleCommand(string naturalLanguageCommand, GameObject target)
     {
         if (string.IsNullOrWhiteSpace(naturalLanguageCommand))
@@ -151,10 +136,6 @@ public class AICodeCommandHandler : MonoBehaviour
             return;
         }
 
-        // Fast path: known particle-effect intents bypass GPT entirely.
-        if (TryHandleAsParticleEffect(naturalLanguageCommand, target))
-            return;
-
         if (string.IsNullOrWhiteSpace(openAiApiKey))
         {
             Log("OpenAI key not found in Inspector or .env");
@@ -162,13 +143,46 @@ public class AICodeCommandHandler : MonoBehaviour
         }
 
         LastAutoTarget = target;
-        StartCoroutine(RequestCode(naturalLanguageCommand, target));
+        StartCoroutine(RequestCode(naturalLanguageCommand, target, effectId: null, isReplay: false));
+    }
+
+    /// <summary>
+    /// Called by ParticleEffectManager when replaying a saved particle effect on scene reload,
+    /// and also used for new particle commands that need to be saved for persistence.
+    ///
+    /// isReplay = true  → skips saving again (already in save file)
+    /// isReplay = false → saves the effect after successful compile
+    /// effectId = null  → generates a new ID (new command)
+    /// effectId = "..." → reuses the existing ID (replay)
+    /// </summary>
+    public void HandleRunCode(string behaviourPrompt, GameObject target,
+                              string effectId = null, bool isReplay = false)
+    {
+        if (target == null)
+        {
+            Log("HandleRunCode: target is null, skipping.");
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(openAiApiKey))
+        {
+            Log("OpenAI key not found.");
+            return;
+        }
+
+        string id = string.IsNullOrEmpty(effectId) ? Guid.NewGuid().ToString() : effectId;
+        LastAutoTarget = target;
+
+        StartCoroutine(RequestCode(behaviourPrompt, target, id, isReplay));
     }
 
     // ------------------------------------------------------------------ auto-target
 
     /// <summary>
-    /// Resolves the best target GameObject using three strategies in order.
+    /// Resolves the best target GameObject using three strategies in order:
+    ///   1. Raycast from camera centre (what the player is looking at)
+    ///   2. Name match — does any scene object's name appear in the command?
+    ///   3. Fallback to the last successfully resolved target
     /// </summary>
     public GameObject ResolveTarget(string command)
     {
@@ -181,9 +195,7 @@ public class AICodeCommandHandler : MonoBehaviour
             {
                 GameObject found = hit.collider.gameObject;
 
-                // Always walk up to the meaningful root so we never target
-                // a child mesh like Mesh1.0 instead of water_fountain_01.
-                // Priority: PersistableAIObject root > topmost named parent.
+                // Walk up to the meaningful root — prefer PersistableAIObject root
                 var persist = found.GetComponentInParent<PersistableAIObject>();
                 if (persist != null)
                 {
@@ -191,8 +203,6 @@ public class AICodeCommandHandler : MonoBehaviour
                 }
                 else
                 {
-                    // Walk to the topmost parent that has a meaningful name
-                    // (skip objects whose name starts with "Mesh" or is very short)
                     Transform t = found.transform;
                     while (t.parent != null && t.parent.parent != null)
                         t = t.parent;
@@ -228,10 +238,6 @@ public class AICodeCommandHandler : MonoBehaviour
         return null;
     }
 
-    /// <summary>
-    /// Checks whether any scene object's name (or a child's name) appears
-    /// as a substring in the command string (case-insensitive).
-    /// </summary>
     static GameObject FindObjectByNameInCommand(string command)
     {
         string cmdLower = command.ToLowerInvariant();
@@ -259,9 +265,11 @@ public class AICodeCommandHandler : MonoBehaviour
 
     // ------------------------------------------------------------------ core coroutine
 
-    IEnumerator RequestCode(string userCommand, GameObject target)
+    IEnumerator RequestCode(string userCommand, GameObject target,
+                            string effectId, bool isReplay)
     {
-        Log("Asking GPT for code for '" + target.name + "'...");
+        Log($"Asking GPT for code — target: '{target.name}'" +
+            (isReplay ? " [REPLAY]" : "") + "...");
 
         string sceneCtx = SceneContextBuilder.Instance != null
             ? SceneContextBuilder.Instance.Build()
@@ -271,49 +279,155 @@ public class AICodeCommandHandler : MonoBehaviour
             .Replace("{TARGET_NAME}", target.name)
             .Replace("{SCENE_CONTEXT}", sceneCtx);
 
-        string payload = BuildPayload(systemPrompt, userCommand);
-        byte[] body = Encoding.UTF8.GetBytes(payload);
+        // Up to 2 attempts: first normal, second with compile errors fed back to GPT
+        string lastCode         = null;
+        string lastCompileError = null;
 
-        using (var www = new UnityWebRequest(kApiUrl, "POST"))
+        for (int attempt = 1; attempt <= 2; attempt++)
         {
-            www.uploadHandler   = new UploadHandlerRaw(body);
-            www.downloadHandler = new DownloadHandlerBuffer();
-            www.SetRequestHeader("Content-Type", "application/json");
-            www.SetRequestHeader("Authorization", "Bearer " + openAiApiKey);
+            // On retry, append the exact compile errors so GPT can self-correct
+            string userMsg = attempt == 1
+                ? userCommand
+                : $"{userCommand}\n\n" +
+                  $"Your previous code attempt failed to compile with these errors:\n{lastCompileError}\n\n" +
+                  $"Here was your previous code:\n```csharp\n{lastCode}\n```\n\n" +
+                  $"Fix ONLY the compile errors and return the corrected full script.";
 
-            yield return www.SendWebRequest();
+            string payload = BuildPayload(systemPrompt, userMsg);
+            byte[] body    = Encoding.UTF8.GetBytes(payload);
 
-            if (www.result != UnityWebRequest.Result.Success)
+            using (var www = new UnityWebRequest(kApiUrl, "POST"))
             {
-                Log("GPT failed: " + www.error + "\n" + www.downloadHandler.text);
-                yield break;
+                www.uploadHandler   = new UploadHandlerRaw(body);
+                www.downloadHandler = new DownloadHandlerBuffer();
+                www.SetRequestHeader("Content-Type", "application/json");
+                www.SetRequestHeader("Authorization", "Bearer " + openAiApiKey);
+
+                yield return www.SendWebRequest();
+
+                if (www.result != UnityWebRequest.Result.Success)
+                {
+                    Log("GPT request failed: " + www.error + "\n" + www.downloadHandler.text);
+                    yield break;
+                }
+
+                string gptText = ExtractContent(www.downloadHandler.text);
+                if (string.IsNullOrEmpty(gptText))
+                {
+                    Log("Empty GPT response.");
+                    yield break;
+                }
+
+                Debug.Log(attempt == 1
+                    ? "[AICodeCommandHandler] GPT response:\n" + gptText
+                    : "[AICodeCommandHandler] GPT retry response:\n" + gptText);
+
+                string code = RuntimeBehaviourRegistry.ParseCodeFromGPTResponse(gptText);
+                if (string.IsNullOrEmpty(code))
+                {
+                    Log("No C# code block found in GPT response.");
+                    yield break;
+                }
+
+                Log($"Compiling and attaching to '{target.name}'" +
+                    (attempt > 1 ? $" (retry {attempt})" : "") + "...");
+
+                // Try the overload that returns compile errors (out param).
+                // If RuntimeBehaviourRegistry only has the old bool overload,
+                // add: public bool RegisterAndAttach(GameObject go, string code, out string err)
+                // that captures errors from the compiler diagnostics and returns them via err.
+                string compileError = null;
+                bool ok = RuntimeBehaviourRegistry.Instance != null &&
+                          RuntimeBehaviourRegistry.Instance.RegisterAndAttach(
+                              target, code, out compileError);
+
+                if (ok)
+                {
+                    Log($"Attached to '{target.name}' successfully" +
+                        (attempt > 1 ? " after retry." : "."));
+
+                    // --- Particle persistence ---
+                    if (!isReplay && IsParticleCommand(userCommand) && effectId != null)
+                    {
+                        if (ParticleEffectManager.Instance != null)
+                        {
+                            GameObject particleGO = FindParticleChildOnTarget(target);
+                            ParticleEffectManager.Instance.SaveEffect(
+                                effectId:        effectId,
+                                targetName:      target.name,
+                                behaviourPrompt: userCommand,
+                                spawnedGO:       particleGO ?? target
+                            );
+                        }
+                        else
+                        {
+                            Debug.LogWarning("[AICodeCommandHandler] ParticleEffectManager not found — particle will not persist.");
+                        }
+                    }
+                    yield break; // success
+                }
+
+                // Compile failed — store errors for retry
+                lastCode         = code;
+                lastCompileError = compileError ?? "Unknown compile error.";
+                Log($"Compile failed (attempt {attempt}): {lastCompileError}");
+
+                if (attempt == 2)
+                    Log("Compile failed after retry — check Console for details.");
+                // else: loop continues to attempt 2
             }
-
-            string gptText = ExtractContent(www.downloadHandler.text);
-            if (string.IsNullOrEmpty(gptText))
-            {
-                Log("Empty GPT response.");
-                yield break;
-            }
-
-            Debug.Log("[AICodeCommandHandler] GPT response:\n" + gptText);
-
-            string code = RuntimeBehaviourRegistry.ParseCodeFromGPTResponse(gptText);
-            if (string.IsNullOrEmpty(code))
-            {
-                Log("No C# code block found in GPT response.");
-                yield break;
-            }
-
-            Log("Compiling and attaching to '" + target.name + "'...");
-
-            bool ok = RuntimeBehaviourRegistry.Instance != null &&
-                      RuntimeBehaviourRegistry.Instance.RegisterAndAttach(target, code);
-
-            Log(ok
-                ? "Attached to '" + target.name + "' successfully."
-                : "Compile failed — check Console for details.");
         }
+    }
+
+    // ------------------------------------------------------------------ particle helpers
+
+    /// <summary>
+    /// Detects whether a behaviour_prompt describes a particle effect.
+    /// The LLM is responsible for writing the actual code — this just decides
+    /// whether to save the command for persistence.
+    /// </summary>
+    static bool IsParticleCommand(string prompt)
+    {
+        if (string.IsNullOrEmpty(prompt)) return false;
+        string lower = prompt.ToLowerInvariant();
+
+        return lower.Contains("particle") ||
+               lower.Contains("fire")     ||
+               lower.Contains("flame")    ||
+               lower.Contains("smoke")    ||
+               lower.Contains("spark")    ||
+               lower.Contains("explosion")||
+               lower.Contains("fountain") ||
+               lower.Contains("water")    ||
+               lower.Contains("rain")     ||
+               lower.Contains("snow")     ||
+               lower.Contains("magic")    ||
+               lower.Contains("glow")     ||
+               lower.Contains("trail")    ||
+               lower.Contains("dust")     ||
+               lower.Contains("fog")      ||
+               lower.Contains("mist");
+    }
+
+    /// <summary>
+    /// After GPT attaches a script, the generated code typically creates a
+    /// child GameObject for the ParticleSystem. This finds it.
+    /// </summary>
+    static GameObject FindParticleChildOnTarget(GameObject target)
+    {
+        // Look one frame later — PS child is created on Start in the generated script
+        // so we check all children for a ParticleSystem component
+        foreach (Transform child in target.transform)
+        {
+            if (child.GetComponent<ParticleSystem>() != null)
+                return child.gameObject;
+        }
+
+        // Maybe the PS is directly on the target
+        if (target.GetComponent<ParticleSystem>() != null)
+            return target;
+
+        return null;
     }
 
     // ------------------------------------------------------------------ helpers

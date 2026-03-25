@@ -1,8 +1,8 @@
 using UnityEngine;
 
 /// <summary>
-/// Lightweight tag component placed on every spawned particle effect GameObject.
-/// Lets the ParticleEffectManager locate and remove specific effects by ID.
+/// Lightweight tag stamped onto every spawned particle effect GameObject.
+/// Lets ParticleEffectManager find and destroy specific effects by ID.
 /// </summary>
 public class ParticleEffectTracker : MonoBehaviour
 {
